@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Doubao Media Downloader
 // @namespace    https://github.com/piboss001/doubao-media-downloader
-// @version      1.0.2
-// @description  豆包生成视频无水印下载助手
+// @version      1.1.0
+// @description  豆包生成视频无水印下载：从 chain/single 的 fallback_api 解析并解码原始视频地址。
 // @author       piboss001
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -15,1862 +15,2884 @@
 // @downloadURL  https://raw.githubusercontent.com/piboss001/doubao-media-downloader/main/doubao-media-downloader.user.js
 // ==/UserScript==
 
-(function () {
-    'use strict';
+(() => {
+  'use strict';
 
-    const VERSION = '1.0.2';
-    const TAG = '[DoubaoDL]';
+  const VERSION = '1.1.0';
+  const TAG = '[DoubaoDL]';
+  const PAGE = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-    const pageWindow =
-        typeof unsafeWindow !== 'undefined'
-            ? unsafeWindow
-            : window;
+  const CHAIN_RE =
+    /^(?:https?:\/\/[^/]*doubao\.com)?\/im\/chain\/single(?:[/?#]|$)/i;
 
-    /* ============================================================
-       STATE
-    ============================================================ */
+  const QAAB_SALT_HEX =
+    '4dd4c2e6b83162090e52b3c7a6733ba4' +
+    '1cb2462b829ab58a196b39db57177524' +
+    'f49baf7f08e8d68d26a72e37c1a95a2f' +
+    '1f05a51892aef2949732b62a38aadd58';
 
-    const state = {
-        originals: new Map(),
-        fallbackApis: new Set(),
-        resolvingApis: new Set(),
-        resolvedApis: new Set(),
-        panelOpen: false
-    };
+  const state = {
+    resources: new Map(),
+    fallbackCache: new Map(),
+    cardBindings: new WeakMap(),
 
-    function log(...args) {
-        console.log(TAG, ...args);
+    batchSeq: 0,
+
+    panelOpen: false,
+
+    status: '等待生成视频…',
+
+    decorateTimer: 0
+  };
+
+  const log = (...a) =>
+    console.log(TAG, ...a);
+
+  const warn = (...a) =>
+    console.warn(TAG, ...a);
+
+  const isHttp = v =>
+    typeof v === 'string' &&
+    /^https?:\/\//i.test(v);
+
+
+  /* =========================================================
+     网络监听
+  ========================================================= */
+
+  function inputUrl(input) {
+    try {
+      if (typeof input === 'string') {
+        return input;
+      }
+
+      if (input?.url) {
+        return String(input.url);
+      }
+
+      if (input?.href) {
+        return String(input.href);
+      }
+    }
+    catch (_) {}
+
+    return '';
+  }
+
+
+  function installFetchHook() {
+    const current =
+      PAGE.fetch;
+
+    if (
+      typeof current !== 'function' ||
+      current.__doubaoDL110
+    ) {
+      return;
     }
 
-    function warn(...args) {
-        console.warn(TAG, ...args);
-    }
+    const original =
+      current;
 
-    function isHttp(value) {
-        return (
-            typeof value === 'string' &&
-            /^https?:\/\//i.test(value)
+
+    async function hooked(input, init) {
+      const response =
+        await original.apply(
+          this,
+          arguments
         );
+
+      try {
+        const url =
+          inputUrl(input);
+
+        if (CHAIN_RE.test(url)) {
+          response
+            .clone()
+            .text()
+            .then(
+              body =>
+                processChain(
+                  body,
+                  url
+                )
+            )
+            .catch(
+              () => {}
+            );
+        }
+      }
+      catch (_) {}
+
+      return response;
     }
 
-    function timestamp() {
-        const d = new Date();
 
-        const p = n =>
-            String(n).padStart(2, '0');
+    Object.defineProperty(
+      hooked,
+      '__doubaoDL110',
+      {
+        value: true
+      }
+    );
 
-        return (
-            d.getFullYear() +
-            p(d.getMonth() + 1) +
-            p(d.getDate()) +
-            '_' +
-            p(d.getHours()) +
-            p(d.getMinutes()) +
-            p(d.getSeconds())
+
+    try {
+      PAGE.fetch =
+        hooked;
+    }
+    catch (e) {
+      warn(
+        'fetch hook failed',
+        e
+      );
+    }
+  }
+
+
+  function installXHRHook() {
+    const XHR =
+      PAGE.XMLHttpRequest;
+
+    if (
+      !XHR ||
+      XHR.prototype.__doubaoDL110
+    ) {
+      return;
+    }
+
+
+    const open =
+      XHR.prototype.open;
+
+
+    XHR.prototype.open =
+      function (
+        method,
+        url
+      ) {
+
+        this.__doubaoDLUrl =
+          String(
+            url || ''
+          );
+
+
+        this.addEventListener(
+          'load',
+          () => {
+
+            try {
+              if (
+                !CHAIN_RE.test(
+                  this.__doubaoDLUrl
+                )
+              ) {
+                return;
+              }
+
+
+              if (
+                this.responseType &&
+                this.responseType !== '' &&
+                this.responseType !== 'text'
+              ) {
+                return;
+              }
+
+
+              processChain(
+                this.responseText || '',
+                this.__doubaoDLUrl
+              );
+            }
+            catch (_) {}
+
+          }
         );
+
+
+        return open.apply(
+          this,
+          arguments
+        );
+      };
+
+
+    Object.defineProperty(
+      XHR.prototype,
+      '__doubaoDL110',
+      {
+        value: true
+      }
+    );
+  }
+
+
+  /* =========================================================
+     chain/single
+  ========================================================= */
+
+  async function processChain(
+    raw,
+    requestURL
+  ) {
+
+    if (!raw) {
+      return;
     }
 
-    /* ============================================================
-       STYLE
-    ============================================================ */
 
-    function installStyle() {
-        if (document.getElementById('doubao-dl-style')) {
-            return;
+    let json;
+
+
+    try {
+      json =
+        JSON.parse(raw);
+    }
+    catch (_) {
+      return;
+    }
+
+
+    const apis =
+      collectFallbackApis(
+        json,
+        raw
+      );
+
+
+    if (!apis.length) {
+      return;
+    }
+
+
+    const batchId =
+      ++state.batchSeq;
+
+    const batchStartedAt =
+      Date.now();
+
+
+    state.status =
+      `发现 ${apis.length} 个视频资源，正在解析…`;
+
+
+    renderPanel();
+
+
+    const found = [];
+
+
+    for (
+      const fallbackApi
+      of apis
+    ) {
+
+      const url =
+        await resolveFallback(
+          fallbackApi
+        );
+
+
+      if (!url) {
+        continue;
+      }
+
+
+      let item =
+        state.resources.get(
+          url
+        );
+
+
+      if (!item) {
+        item = {
+          url,
+
+          createdAt:
+            Date.now(),
+
+          batchId,
+
+          batchStartedAt,
+
+          fallbackApi,
+
+          requestURL,
+
+          assignedVideo:
+            null
+        };
+
+
+        state.resources.set(
+          url,
+          item
+        );
+      }
+
+
+      found.push(
+        item
+      );
+    }
+
+
+    if (
+      found.length
+    ) {
+
+      state.status =
+        `已解析 ${found.length} 个无水印视频`;
+
+
+      bindResourcesToCards();
+
+      renderPanel();
+
+
+      toast(
+        `已解析 ${found.length} 个无水印视频`
+      );
+
+    }
+    else {
+
+      state.status =
+        '已捕获生成接口，但无水印地址解码失败';
+
+
+      renderPanel();
+
+
+      toast(
+        state.status
+      );
+
+    }
+  }
+
+
+  /* =========================================================
+     找 fallback_api
+  ========================================================= */
+
+  function collectFallbackApis(
+    json,
+    raw
+  ) {
+
+    const set =
+      new Set();
+
+
+    walk(
+      json,
+      node => {
+
+        if (
+          node &&
+          typeof node === 'object' &&
+          !Array.isArray(node) &&
+          Object.prototype
+            .hasOwnProperty
+            .call(
+              node,
+              'fallback_api'
+            )
+        ) {
+
+          addFallback(
+            set,
+            node.fallback_api
+          );
+
+        }
+      }
+    );
+
+
+    for (
+      const re
+      of [
+        /fallback_api\\":\\"(.*?)\\"/g,
+
+        /"fallback_api"\s*:\s*"([^"]+)"/g
+      ]
+    ) {
+
+      let m;
+
+
+      while (
+        (
+          m =
+            re.exec(raw)
+        )
+      ) {
+
+        addFallback(
+          set,
+          m[1]
+        );
+
+      }
+    }
+
+
+    return [
+      ...set
+    ];
+  }
+
+
+  function addFallback(
+    set,
+    value
+  ) {
+
+    if (
+      typeof value !== 'string' ||
+      !value
+    ) {
+      return;
+    }
+
+
+    const url =
+      decodeEscaped(
+        value
+      );
+
+
+    if (
+      isHttp(url)
+    ) {
+      set.add(url);
+    }
+  }
+
+
+  function decodeEscaped(
+    value
+  ) {
+
+    let text =
+      String(
+        value || ''
+      );
+
+
+    for (
+      let i = 0;
+      i < 3;
+      i++
+    ) {
+
+      try {
+
+        const next =
+          JSON.parse(
+            `"${text.replace(
+              /"/g,
+              '\\"'
+            )}"`
+          );
+
+
+        if (
+          next === text
+        ) {
+          break;
         }
 
-        const style = document.createElement('style');
 
-        style.id = 'doubao-dl-style';
+        text =
+          next;
 
-        style.textContent = `
+      }
+      catch (_) {
+        break;
+      }
+    }
 
-.doubao-dl-card-button {
-    position:absolute !important;
-    left:10px !important;
-    top:10px !important;
 
-    z-index:2147483000 !important;
+    return text
+      .replace(
+        /\\u0026/gi,
+        '&'
+      )
+      .replace(
+        /\\\//g,
+        '/'
+      )
+      .replace(
+        /\\"/g,
+        '"'
+      );
+  }
 
-    height:34px !important;
-    padding:0 12px !important;
 
-    display:flex !important;
-    align-items:center !important;
-    gap:6px !important;
+  function walk(
+    value,
+    visitor,
+    seen = new Set(),
+    depth = 0
+  ) {
 
-    border:1px solid rgba(255,255,255,.20) !important;
-    border-radius:8px !important;
+    if (
+      value == null ||
+      depth > 18
+    ) {
+      return;
+    }
 
-    background:rgba(15,15,18,.82) !important;
-    color:#fff !important;
 
-    box-shadow:0 3px 12px rgba(0,0,0,.22) !important;
+    if (
+      typeof value === 'string'
+    ) {
 
-    backdrop-filter:blur(8px) !important;
+      const s =
+        value.trim();
 
-    font-family:
-        -apple-system,
-        BlinkMacSystemFont,
-        "PingFang SC",
-        "Microsoft YaHei",
-        sans-serif !important;
 
-    font-size:13px !important;
-    font-weight:500 !important;
+      if (
+        s.length <
+          2000000 &&
+        (
+          s.startsWith('{') ||
+          s.startsWith('[')
+        )
+      ) {
 
-    cursor:pointer !important;
+        try {
+          walk(
+            JSON.parse(s),
+            visitor,
+            seen,
+            depth + 1
+          );
+        }
+        catch (_) {}
 
-    transition:.15s ease !important;
+      }
+
+
+      return;
+    }
+
+
+    if (
+      typeof value !== 'object' ||
+      seen.has(value)
+    ) {
+      return;
+    }
+
+
+    seen.add(value);
+
+
+    visitor(value);
+
+
+    if (
+      Array.isArray(value)
+    ) {
+
+      for (
+        const x
+        of value
+      ) {
+        walk(
+          x,
+          visitor,
+          seen,
+          depth + 1
+        );
+      }
+
+    }
+    else {
+
+      for (
+        const x
+        of Object.values(value)
+      ) {
+
+        walk(
+          x,
+          visitor,
+          seen,
+          depth + 1
+        );
+
+      }
+    }
+  }
+
+
+  /* =========================================================
+     请求 fallback_api
+  ========================================================= */
+
+  function gmGet(url) {
+
+    return new Promise(
+      (
+        resolve,
+        reject
+      ) => {
+
+        GM_xmlhttpRequest({
+
+          method:
+            'GET',
+
+          url,
+
+          headers: {
+            Accept:
+              'application/json,text/plain,*/*'
+          },
+
+          anonymous:
+            true,
+
+          responseType:
+            'text',
+
+          timeout:
+            30000,
+
+
+          onload:
+            r =>
+              resolve(
+                r.responseText || ''
+              ),
+
+
+          onerror:
+            reject,
+
+
+          ontimeout:
+            () =>
+              reject(
+                new Error(
+                  'timeout'
+                )
+              )
+
+        });
+
+      }
+    );
+  }
+
+
+  function resolveFallback(
+    fallbackApi
+  ) {
+
+    if (
+      state.fallbackCache.has(
+        fallbackApi
+      )
+    ) {
+
+      return state
+        .fallbackCache
+        .get(
+          fallbackApi
+        );
+
+    }
+
+
+    const task =
+      (
+        async () => {
+
+          try {
+
+            const u =
+              new URL(
+                fallbackApi
+              );
+
+
+            u.searchParams.set(
+              'channel',
+              'no'
+            );
+
+
+            u.searchParams.set(
+              'codec_type',
+              '8'
+            );
+
+
+            u.searchParams.set(
+              'logo_type',
+              'unwatermarked'
+            );
+
+
+            const payload =
+              JSON.parse(
+                await gmGet(
+                  u.toString()
+                )
+              );
+
+
+            const data =
+              videoData(
+                payload
+              );
+
+
+            const token =
+              bestToken(
+                data
+              );
+
+
+            if (!token) {
+              return '';
+            }
+
+
+            const finalURL =
+              await decodeToken(
+                token,
+                findKeySeed(
+                  payload
+                )
+              );
+
+
+            if (
+              !isHttp(
+                finalURL
+              )
+            ) {
+              return '';
+            }
+
+
+            if (
+              /\.(?:png|jpe?g|gif|webp|avif)(?:[?#]|$)/i
+                .test(
+                  finalURL
+                )
+            ) {
+
+              return '';
+            }
+
+
+            return finalURL;
+
+          }
+          catch (e) {
+
+            warn(
+              'fallback resolve failed',
+              e
+            );
+
+
+            return '';
+
+          }
+
+        }
+      )();
+
+
+    state.fallbackCache.set(
+      fallbackApi,
+      task
+    );
+
+
+    return task;
+  }
+
+
+  /* =========================================================
+     fallback 视频数据
+  ========================================================= */
+
+  function videoData(
+    payload
+  ) {
+
+    const info =
+      payload?.video_info ||
+      payload?.data?.video_info ||
+      payload;
+
+
+    const data =
+      info?.data ||
+      info;
+
+
+    return (
+      data &&
+      typeof data === 'object'
+    )
+      ? data
+      : {};
+  }
+
+
+  function bestToken(
+    data
+  ) {
+
+    const list =
+      data?.video_list;
+
+
+    const entries =
+      list &&
+      typeof list === 'object' &&
+      Object.keys(list).length
+
+        ? Object.values(
+            list
+          )
+
+        : [
+            data
+          ];
+
+
+    let best =
+      null;
+
+
+    for (
+      const entry
+      of entries
+    ) {
+
+      if (
+        !entry ||
+        typeof entry !== 'object'
+      ) {
+        continue;
+      }
+
+
+      const token =
+        entry.main_url ||
+        entry.play_url ||
+        '';
+
+
+      if (
+        typeof token !== 'string' ||
+        !token.trim()
+      ) {
+        continue;
+      }
+
+
+      const score =
+        Number(
+          entry.bitrate ||
+          entry.real_bitrate ||
+          0
+        )
+        +
+        Number(
+          entry.vwidth ||
+          entry.width ||
+          0
+        )
+        *
+        Number(
+          entry.vheight ||
+          entry.height ||
+          0
+        );
+
+
+      if (
+        !best ||
+        score > best.score
+      ) {
+
+        best = {
+          token:
+            token.trim(),
+
+          score
+        };
+
+      }
+    }
+
+
+    return best?.token || '';
+  }
+
+
+  /* =========================================================
+     key_seed
+  ========================================================= */
+
+  function findKeySeed(
+    value,
+    depth = 0
+  ) {
+
+    if (
+      value == null ||
+      depth > 10
+    ) {
+      return '';
+    }
+
+
+    if (
+      typeof value === 'string'
+    ) {
+
+      let m =
+        value.match(
+          /(?:^|[?&])key_seed=([^&"'<>\\\s]+)/i
+        );
+
+
+      if (m) {
+        return safeDecode(
+          m[1]
+        );
+      }
+
+
+      m =
+        value.match(
+          /["']key_seed["']\s*:\s*["']([^"']+)/i
+        );
+
+
+      return m
+        ? safeDecode(
+            m[1]
+          )
+        : '';
+    }
+
+
+    if (
+      typeof value !== 'object'
+    ) {
+      return '';
+    }
+
+
+    if (
+      typeof value.key_seed === 'string' &&
+      value.key_seed.trim()
+    ) {
+
+      return value
+        .key_seed
+        .trim();
+
+    }
+
+
+    for (
+      const x
+      of Object.values(value)
+    ) {
+
+      const hit =
+        findKeySeed(
+          x,
+          depth + 1
+        );
+
+
+      if (hit) {
+        return hit;
+      }
+    }
+
+
+    return '';
+  }
+
+
+  function safeDecode(s) {
+    try {
+      return decodeURIComponent(
+        s
+      );
+    }
+    catch (_) {
+      return s;
+    }
+  }
+
+
+  /* =========================================================
+     main_url 解码
+  ========================================================= */
+
+  async function decodeToken(
+    token,
+    keySeed = ''
+  ) {
+
+    if (
+      isHttp(token)
+    ) {
+      return token;
+    }
+
+
+    const plain =
+      tryBase64Url(
+        token
+      );
+
+
+    if (plain) {
+      return plain;
+    }
+
+
+    if (
+      String(token)
+        .startsWith(
+          'qAAB'
+        ) &&
+      keySeed
+    ) {
+
+      return decodeQaab(
+        token,
+        keySeed
+      );
+
+    }
+
+
+    return '';
+  }
+
+
+  function tryBase64Url(
+    token
+  ) {
+
+    const bytes =
+      base64Loose(
+        token
+      );
+
+
+    if (!bytes) {
+      return '';
+    }
+
+
+    const text =
+      ascii(
+        bytes
+      );
+
+
+    return isHttp(text)
+      ? text
+      : '';
+  }
+
+
+  function base64Loose(
+    value
+  ) {
+
+    const input =
+      String(
+        value || ''
+      ).trim();
+
+
+    const variants = [
+
+      input,
+
+      input.replace(
+        /[$@#]/g,
+        c => ({
+          '$': '_',
+          '@': '/',
+          '#': '.'
+        })[c]
+      ),
+
+      input.replace(
+        /[$@#]/g,
+        c => ({
+          '$': '+',
+          '@': '/',
+          '#': '='
+        })[c]
+      )
+
+    ];
+
+
+    const seen =
+      new Set();
+
+
+    for (
+      let s
+      of variants
+    ) {
+
+      if (
+        !s ||
+        seen.has(s)
+      ) {
+        continue;
+      }
+
+
+      seen.add(s);
+
+
+      try {
+
+        s =
+          s
+            .replace(
+              /-/g,
+              '+'
+            )
+            .replace(
+              /_/g,
+              '/'
+            );
+
+
+        s +=
+          '='.repeat(
+            (
+              4 -
+              s.length % 4
+            )
+            % 4
+          );
+
+
+        const b =
+          atob(s);
+
+
+        const out =
+          new Uint8Array(
+            b.length
+          );
+
+
+        for (
+          let i = 0;
+          i < b.length;
+          i++
+        ) {
+
+          out[i] =
+            b.charCodeAt(i);
+
+        }
+
+
+        return out;
+
+      }
+      catch (_) {}
+
+    }
+
+
+    return null;
+  }
+
+
+  function ascii(
+    bytes
+  ) {
+
+    if (
+      !bytes?.length
+    ) {
+      return '';
+    }
+
+
+    for (
+      const b
+      of bytes
+    ) {
+
+      if (
+        b !== 9 &&
+        b !== 10 &&
+        b !== 13 &&
+        (
+          b < 32 ||
+          b > 126
+        )
+      ) {
+
+        return '';
+
+      }
+    }
+
+
+    return new TextDecoder()
+      .decode(
+        bytes
+      );
+  }
+
+
+  /* =========================================================
+     qAAB AES
+  ========================================================= */
+
+  async function decodeQaab(
+    token,
+    keySeed
+  ) {
+
+    const data =
+      base64Loose(
+        token
+      );
+
+
+    const seed =
+      base64Loose(
+        keySeed
+      );
+
+
+    if (
+      !data ||
+      !seed
+    ) {
+      return '';
+    }
+
+
+    const h1 =
+      await crypto.subtle.digest(
+        'SHA-512',
+        seed.slice(
+          0,
+          32
+        )
+      );
+
+
+    const h2 =
+      new Uint8Array(
+
+        await crypto.subtle.digest(
+
+          'SHA-512',
+
+          concat(
+
+            new Uint8Array(
+              h1
+            ),
+
+            hexBytes(
+              QAAB_SALT_HEX
+            )
+
+          )
+
+        )
+
+      );
+
+
+    const key =
+      h2.slice(
+        0,
+        16
+      );
+
+
+    const iv =
+      h2.slice(
+        16,
+        32
+      );
+
+
+    const tries =
+      [];
+
+
+    if (
+      data.length >= 4 &&
+      data[0] === 0xa8 &&
+      data[1] === 0 &&
+      data[2] === 1 &&
+      data[3] === 0
+    ) {
+
+      tries.push(
+
+        [
+          data.slice(4),
+          key,
+          iv
+        ],
+
+        [
+          data.slice(4),
+          iv,
+          key
+        ]
+
+      );
+
+
+      if (
+        data.length > 36
+      ) {
+
+        tries.push(
+
+          [
+            data.slice(36),
+            key,
+            data.slice(
+              20,
+              36
+            )
+          ],
+
+          [
+            data.slice(36),
+            key,
+            iv
+          ]
+
+        );
+
+      }
+
+    }
+    else {
+
+      tries.push(
+        [
+          data,
+          key,
+          iv
+        ]
+      );
+
+    }
+
+
+    for (
+      const [
+        payload,
+        k,
+        v
+      ]
+      of tries
+    ) {
+
+      const url =
+        await aesUrl(
+          payload,
+          k,
+          v
+        );
+
+
+      if (url) {
+        return url;
+      }
+    }
+
+
+    return '';
+  }
+
+
+  async function aesUrl(
+    payload,
+    keyBytes,
+    ivBytes
+  ) {
+
+    if (
+      !payload.length ||
+      payload.length % 16
+    ) {
+      return '';
+    }
+
+
+    try {
+
+      const key =
+        await crypto.subtle.importKey(
+
+          'raw',
+
+          keyBytes,
+
+          'AES-CBC',
+
+          false,
+
+          [
+            'decrypt'
+          ]
+
+        );
+
+
+      const plain =
+        new Uint8Array(
+
+          await crypto.subtle.decrypt(
+
+            {
+              name:
+                'AES-CBC',
+
+              iv:
+                ivBytes
+            },
+
+            key,
+
+            payload
+
+          )
+
+        );
+
+
+      const direct =
+        ascii(
+          plain
+        );
+
+
+      if (
+        isHttp(
+          direct
+        )
+      ) {
+        return direct;
+      }
+
+
+      const stripped =
+        unpad(
+          plain
+        );
+
+
+      const text =
+        ascii(
+          stripped
+        );
+
+
+      return isHttp(text)
+        ? text
+        : '';
+
+    }
+    catch (_) {
+
+      return '';
+
+    }
+  }
+
+
+  function unpad(
+    bytes
+  ) {
+
+    if (
+      !bytes?.length
+    ) {
+      return new Uint8Array();
+    }
+
+
+    const p =
+      bytes[
+        bytes.length - 1
+      ];
+
+
+    if (
+      p < 1 ||
+      p > 16 ||
+      p > bytes.length
+    ) {
+      return bytes;
+    }
+
+
+    for (
+      let i =
+        bytes.length - p;
+
+      i < bytes.length;
+
+      i++
+    ) {
+
+      if (
+        bytes[i] !== p
+      ) {
+        return bytes;
+      }
+
+    }
+
+
+    return bytes.slice(
+      0,
+      bytes.length - p
+    );
+  }
+
+
+  function hexBytes(
+    hex
+  ) {
+
+    const out =
+      new Uint8Array(
+        hex.length / 2
+      );
+
+
+    for (
+      let i = 0;
+      i < out.length;
+      i++
+    ) {
+
+      out[i] =
+        parseInt(
+          hex.slice(
+            i * 2,
+            i * 2 + 2
+          ),
+          16
+        );
+
+    }
+
+
+    return out;
+  }
+
+
+  function concat(
+    a,
+    b
+  ) {
+
+    const out =
+      new Uint8Array(
+        a.length +
+        b.length
+      );
+
+
+    out.set(a);
+
+    out.set(
+      b,
+      a.length
+    );
+
+
+    return out;
+  }
+
+
+  /* =========================================================
+     视频卡片
+  ========================================================= */
+
+  function visibleVideos() {
+
+    return [
+      ...document
+        .querySelectorAll(
+          'video'
+        )
+    ]
+      .filter(
+        v => {
+
+          const r =
+            v.getBoundingClientRect();
+
+
+          return (
+            r.width >= 160 &&
+            r.height >= 180 &&
+            r.width <= 900 &&
+            r.height <= 1300
+          );
+
+        }
+      );
+  }
+
+
+  function videoContainer(
+    video
+  ) {
+
+    const vr =
+      video
+        .getBoundingClientRect();
+
+
+    let node =
+      video.parentElement;
+
+
+    let best =
+      node || video;
+
+
+    for (
+      let i = 0;
+
+      node &&
+      i < 6;
+
+      i++,
+      node =
+        node.parentElement
+    ) {
+
+      const r =
+        node
+          .getBoundingClientRect();
+
+
+      if (
+        !r.width ||
+        !r.height
+      ) {
+        continue;
+      }
+
+
+      if (
+        r.width >= vr.width &&
+        r.height >= vr.height &&
+        r.width / vr.width <= 1.4 &&
+        r.height / vr.height <= 1.4
+      ) {
+
+        best =
+          node;
+
+      }
+      else {
+
+        break;
+
+      }
+    }
+
+
+    return best;
+  }
+
+
+  function bind(
+    video,
+    item
+  ) {
+
+    state.cardBindings.set(
+      video,
+      item
+    );
+
+
+    item.assignedVideo =
+      video;
+  }
+
+
+  function bindResourcesToCards() {
+
+    const videos =
+      visibleVideos();
+
+
+    const items =
+      [
+        ...state
+          .resources
+          .values()
+      ]
+        .sort(
+          (
+            a,
+            b
+          ) =>
+            a.createdAt -
+            b.createdAt
+        );
+
+
+    for (
+      const item
+      of items
+    ) {
+
+      if (
+        item.assignedVideo &&
+        !document.contains(
+          item.assignedVideo
+        )
+      ) {
+
+        item.assignedVideo =
+          null;
+
+      }
+    }
+
+
+    const unbound =
+      videos.filter(
+        v =>
+          !state
+            .cardBindings
+            .has(v)
+      );
+
+
+    const free =
+      items.filter(
+        x =>
+          !x.assignedVideo
+      );
+
+
+    if (
+      unbound.length &&
+      unbound.length === free.length
+    ) {
+
+      unbound.forEach(
+        (
+          v,
+          i
+        ) =>
+          bind(
+            v,
+            free[i]
+          )
+      );
+
+    }
+    else if (
+      unbound.length === 1 &&
+      free.length === 1
+    ) {
+
+      bind(
+        unbound[0],
+        free[0]
+      );
+
+    }
+    else if (
+      free.length === 1 &&
+      unbound.length > 1
+    ) {
+
+      const nearby =
+        unbound.filter(
+          v =>
+            Math.abs(
+              (
+                v.__doubaoDLSeenAt ||
+                0
+              )
+              -
+              free[0]
+                .batchStartedAt
+            )
+            <=
+            12000
+        );
+
+
+      if (
+        nearby.length === 1
+      ) {
+
+        bind(
+          nearby[0],
+          free[0]
+        );
+
+      }
+    }
+
+
+    updateButtons();
+  }
+
+
+  /* =========================================================
+     样式
+  ========================================================= */
+
+  function installStyle() {
+
+    if (
+      document.getElementById(
+        'doubao-dl-style'
+      )
+    ) {
+      return;
+    }
+
+
+    const s =
+      document.createElement(
+        'style'
+      );
+
+
+    s.id =
+      'doubao-dl-style';
+
+
+    s.textContent = `
+
+.doubao-dl-card{
+position:absolute!important;
+left:10px!important;
+top:10px!important;
+z-index:2147483000!important;
+height:34px!important;
+padding:0 11px!important;
+border:1px solid rgba(255,255,255,.2)!important;
+border-radius:8px!important;
+background:rgba(16,16,18,.86)!important;
+color:#fff!important;
+cursor:pointer!important;
+font:500 13px/1 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif!important;
+box-shadow:0 3px 12px rgba(0,0,0,.24)!important;
+backdrop-filter:blur(8px)!important;
 }
 
-.doubao-dl-card-button:hover {
-    background:rgba(0,0,0,.95) !important;
-    transform:translateY(-1px);
+.doubao-dl-card:hover{
+background:#000!important;
 }
 
-.doubao-dl-card-button.is-ready {
-    background:rgba(15,15,18,.88) !important;
+.doubao-dl-card[data-ready="0"]{
+opacity:.72!important;
 }
 
-.doubao-dl-card-button.is-waiting {
-    opacity:.78 !important;
+
+#doubao-dl-fab{
+position:fixed!important;
+right:20px!important;
+bottom:96px!important;
+z-index:2147483645!important;
+width:48px!important;
+height:48px!important;
+border:0!important;
+border-radius:14px!important;
+background:#18181b!important;
+color:#fff!important;
+cursor:pointer!important;
+font-size:20px!important;
+box-shadow:0 8px 30px rgba(0,0,0,.24)!important;
 }
 
-#doubao-dl-fab {
-    position:fixed !important;
 
-    right:22px !important;
-    bottom:100px !important;
-
-    z-index:2147483645 !important;
-
-    width:48px !important;
-    height:48px !important;
-
-    border:0 !important;
-    border-radius:14px !important;
-
-    background:#18181b !important;
-    color:#fff !important;
-
-    font-size:20px !important;
-
-    cursor:pointer !important;
-
-    box-shadow:
-        0 8px 30px
-        rgba(0,0,0,.24) !important;
+#doubao-dl-badge{
+position:absolute;
+right:-5px;
+top:-5px;
+min-width:18px;
+height:18px;
+padding:0 4px;
+border-radius:9px;
+background:#fff;
+color:#111;
+display:flex;
+align-items:center;
+justify-content:center;
+font:600 10px/1 sans-serif;
 }
 
-#doubao-dl-fab-count {
-    position:absolute;
 
-    right:-5px;
-    top:-5px;
-
-    min-width:18px;
-    height:18px;
-
-    padding:0 4px;
-
-    display:flex;
-    align-items:center;
-    justify-content:center;
-
-    border-radius:9px;
-
-    background:#fff;
-    color:#111;
-
-    font-size:10px;
-    font-weight:600;
-
-    box-shadow:0 2px 8px rgba(0,0,0,.18);
+#doubao-dl-panel{
+position:fixed!important;
+right:20px!important;
+bottom:154px!important;
+z-index:2147483646!important;
+width:360px!important;
+max-height:460px!important;
+background:#fff!important;
+color:#18181b!important;
+border:1px solid #eee!important;
+border-radius:16px!important;
+box-shadow:0 16px 50px rgba(0,0,0,.18)!important;
+overflow:hidden!important;
+font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif!important;
 }
 
-#doubao-dl-panel {
-    position:fixed !important;
 
-    right:22px !important;
-    bottom:158px !important;
-
-    z-index:2147483646 !important;
-
-    width:360px !important;
-    max-height:470px !important;
-
-    background:#fff !important;
-    color:#18181b !important;
-
-    border:
-        1px solid
-        rgba(0,0,0,.08) !important;
-
-    border-radius:16px !important;
-
-    box-shadow:
-        0 16px 50px
-        rgba(0,0,0,.18) !important;
-
-    overflow:hidden !important;
-
-    font-family:
-        -apple-system,
-        BlinkMacSystemFont,
-        "PingFang SC",
-        "Microsoft YaHei",
-        sans-serif !important;
+#doubao-dl-panel[hidden]{
+display:none!important;
 }
 
-#doubao-dl-panel[hidden] {
-    display:none !important;
+
+.ddl-head{
+padding:14px 15px;
+border-bottom:1px solid #eee;
+display:flex;
+justify-content:space-between;
+gap:12px;
 }
 
-.doubao-dl-head {
-    height:54px;
 
-    padding:0 15px;
-
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-
-    border-bottom:1px solid #eee;
+.ddl-title{
+font-weight:650;
 }
 
-.doubao-dl-title {
-    font-size:15px;
-    font-weight:600;
+
+.ddl-status{
+font-size:11px;
+color:#888;
+text-align:right;
 }
 
-.doubao-dl-version {
-    margin-left:4px;
 
-    color:#999;
-
-    font-size:11px;
-    font-weight:400;
+.ddl-list{
+max-height:320px;
+overflow:auto;
+padding:8px;
 }
 
-.doubao-dl-status {
-    font-size:11px;
-    color:#888;
+
+.ddl-empty{
+padding:30px 12px;
+text-align:center;
+color:#999;
+font-size:13px;
+line-height:1.8;
 }
 
-.doubao-dl-list {
-    padding:8px;
 
-    max-height:330px;
-
-    overflow:auto;
+.ddl-item{
+display:flex;
+align-items:center;
+gap:8px;
+padding:9px;
+border-radius:9px;
 }
 
-.doubao-dl-empty {
-    padding:34px 12px;
 
-    text-align:center;
-
-    color:#999;
-
-    font-size:13px;
-    line-height:1.8;
+.ddl-item:hover{
+background:#f6f6f7;
 }
 
-.doubao-dl-item {
-    display:flex;
-    align-items:center;
 
-    gap:8px;
-
-    padding:9px;
-
-    border-radius:9px;
+.ddl-info{
+flex:1;
+min-width:0;
 }
 
-.doubao-dl-item:hover {
-    background:#f6f6f7;
+
+.ddl-name{
+font-size:12px;
+font-weight:550;
 }
 
-.doubao-dl-item-index {
-    width:25px;
 
-    color:#999;
-
-    font-size:11px;
+.ddl-url{
+font-size:10px;
+color:#999;
+white-space:nowrap;
+overflow:hidden;
+text-overflow:ellipsis;
 }
 
-.doubao-dl-item-info {
-    flex:1;
 
-    min-width:0;
+.ddl-down{
+border:0;
+border-radius:7px;
+background:#18181b;
+color:#fff;
+padding:7px 10px;
+cursor:pointer;
 }
 
-.doubao-dl-item-title {
-    margin-bottom:3px;
 
-    font-size:12px;
-    font-weight:500;
+.ddl-foot{
+padding:11px 13px;
+border-top:1px solid #eee;
+font-size:11px;
+color:#888;
 }
 
-.doubao-dl-item-url {
-    overflow:hidden;
 
-    color:#999;
-
-    font-size:10px;
-
-    white-space:nowrap;
-    text-overflow:ellipsis;
-}
-
-.doubao-dl-download {
-    border:0;
-
-    padding:7px 10px;
-
-    border-radius:7px;
-
-    background:#18181b;
-    color:#fff;
-
-    font-size:12px;
-
-    cursor:pointer;
-}
-
-.doubao-dl-footer {
-    min-height:45px;
-
-    padding:0 13px;
-
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-
-    border-top:1px solid #eee;
-
-    color:#888;
-
-    font-size:11px;
-}
-
-.doubao-dl-clear {
-    border:0;
-    background:none;
-
-    color:#666;
-
-    cursor:pointer;
-}
-
-#doubao-dl-toast {
-    position:fixed;
-
-    left:50%;
-    bottom:80px;
-
-    transform:translateX(-50%);
-
-    z-index:2147483647;
-
-    padding:9px 15px;
-
-    border-radius:9px;
-
-    background:rgba(0,0,0,.82);
-    color:#fff;
-
-    font-family:
-        -apple-system,
-        BlinkMacSystemFont,
-        "PingFang SC",
-        "Microsoft YaHei",
-        sans-serif;
-
-    font-size:13px;
-
-    pointer-events:none;
+#doubao-dl-toast{
+position:fixed;
+left:50%;
+bottom:78px;
+transform:translateX(-50%);
+z-index:2147483647;
+background:rgba(0,0,0,.82);
+color:#fff;
+padding:9px 15px;
+border-radius:9px;
+font:13px/1.4 sans-serif;
+pointer-events:none;
 }
 
 `;
 
-        (
-            document.head ||
-            document.documentElement
-        ).appendChild(style);
+
+    (
+      document.head ||
+      document.documentElement
+    ).appendChild(s);
+  }
+
+
+  /* =========================================================
+     右侧窗口
+  ========================================================= */
+
+  function createUI() {
+
+    if (
+      document.getElementById(
+        'doubao-dl-fab'
+      )
+    ) {
+      return;
     }
 
-    /* ============================================================
-       TOAST
-    ============================================================ */
 
-    let toastTimer;
+    const fab =
+      document.createElement(
+        'button'
+      );
 
-    function toast(message) {
-        let el =
-            document.getElementById(
-                'doubao-dl-toast'
-            );
 
-        if (!el) {
-            el =
-                document.createElement('div');
+    fab.id =
+      'doubao-dl-fab';
 
-            el.id =
-                'doubao-dl-toast';
 
-            document.documentElement
-                .appendChild(el);
-        }
+    fab.type =
+      'button';
 
-        el.textContent =
-            message;
 
-        clearTimeout(toastTimer);
+    fab.innerHTML =
+      '↓<span id="doubao-dl-badge">0</span>';
 
-        toastTimer =
-            setTimeout(() => {
-                el.remove();
-            }, 2600);
-    }
 
-    /* ============================================================
-       FLOATING PANEL
-    ============================================================ */
+    const panel =
+      document.createElement(
+        'div'
+      );
 
-    function createUI() {
-        if (
-            document.getElementById(
-                'doubao-dl-fab'
-            )
-        ) {
-            return;
-        }
 
-        const fab =
-            document.createElement('button');
+    panel.id =
+      'doubao-dl-panel';
 
-        fab.id =
-            'doubao-dl-fab';
 
-        fab.innerHTML = `
-            ↓
-            <span id="doubao-dl-fab-count">0</span>
-        `;
+    panel.hidden =
+      true;
 
-        fab.title =
-            '豆包无水印资源';
 
-        const panel =
-            document.createElement('div');
+    panel.innerHTML = `
 
-        panel.id =
-            'doubao-dl-panel';
+<div class="ddl-head">
 
-        panel.hidden =
-            true;
+<div class="ddl-title">
+豆包资源助手
+<small>v${VERSION}</small>
+</div>
 
-        panel.innerHTML = `
-
-<div class="doubao-dl-head">
-
-    <div class="doubao-dl-title">
-
-        豆包资源助手
-
-        <span class="doubao-dl-version">
-            v${VERSION}
-        </span>
-
-    </div>
-
-    <div
-        class="doubao-dl-status"
-        id="doubao-dl-status"
-    >
-        0 个无水印资源
-    </div>
+<div
+class="ddl-status"
+id="ddl-status">
+</div>
 
 </div>
 
 <div
-    class="doubao-dl-list"
-    id="doubao-dl-list"
->
+class="ddl-list"
+id="ddl-list">
 </div>
 
-<div class="doubao-dl-footer">
-
-    <span>
-        仅下载已确认解析的原始资源
-    </span>
-
-    <button
-        class="doubao-dl-clear"
-        id="doubao-dl-clear"
-    >
-        清空
-    </button>
-
+<div class="ddl-foot">
+只接受 chain/single → fallback_api → 解码后的无水印视频地址
 </div>
 
 `;
 
-        fab.addEventListener(
-            'click',
-            () => {
-                state.panelOpen =
-                    !state.panelOpen;
 
-                panel.hidden =
-                    !state.panelOpen;
-            }
-        );
-
-        panel
-            .querySelector(
-                '#doubao-dl-clear'
-            )
-            .addEventListener(
-                'click',
-                () => {
-                    state.originals.clear();
-
-                    updateUI();
-                }
-            );
-
-        document.documentElement
-            .appendChild(fab);
-
-        document.documentElement
-            .appendChild(panel);
-
-        updateUI();
-    }
-
-    function updateUI() {
-        const count =
-            state.originals.size;
-
-        const badge =
-            document.getElementById(
-                'doubao-dl-fab-count'
-            );
-
-        const status =
-            document.getElementById(
-                'doubao-dl-status'
-            );
-
-        const list =
-            document.getElementById(
-                'doubao-dl-list'
-            );
-
-        if (badge) {
-            badge.textContent =
-                count;
-        }
-
-        if (status) {
-            status.textContent =
-                `${count} 个无水印资源`;
-        }
-
-        if (!list) {
-            return;
-        }
-
-        list.innerHTML =
-            '';
-
-        const resources =
-            [...state.originals.values()]
-                .sort(
-                    (a, b) =>
-                        b.time - a.time
-                );
-
-        if (!resources.length) {
-            list.innerHTML = `
-
-<div class="doubao-dl-empty">
-
-    暂未捕获到无水印资源
-
-    <br>
-
-    请在脚本启动后重新生成一个视频
-
-</div>
-
-`;
-
-            updateCardButtons();
-
-            return;
-        }
-
-        resources.forEach(
-            (item, index) => {
-                const row =
-                    document.createElement('div');
-
-                row.className =
-                    'doubao-dl-item';
-
-                row.innerHTML = `
-
-<div class="doubao-dl-item-index">
-    ${index + 1}
-</div>
-
-<div class="doubao-dl-item-info">
-
-    <div class="doubao-dl-item-title">
-        无水印视频
-    </div>
-
-    <div
-        class="doubao-dl-item-url"
-        title="${escapeHtml(item.url)}"
-    >
-        ${escapeHtml(item.url)}
-    </div>
-
-</div>
-
-<button class="doubao-dl-download">
-    下载
-</button>
-
-`;
-
-                row
-                    .querySelector(
-                        '.doubao-dl-download'
-                    )
-                    .addEventListener(
-                        'click',
-                        () => {
-                            downloadOriginal(
-                                item.url
-                            );
-                        }
-                    );
-
-                list.appendChild(row);
-            }
-        );
-
-        updateCardButtons();
-    }
-
-    function escapeHtml(value) {
-        return String(value || '')
-            .replace(
-                /[&<>"']/g,
-                char => ({
-                    '&': '&amp;',
-                    '<': '&lt;',
-                    '>': '&gt;',
-                    '"': '&quot;',
-                    "'": '&#39;'
-                })[char]
-            );
-    }
-
-    /* ============================================================
-       STORE ONLY CONFIRMED ORIGINALS
-    ============================================================ */
-
-    function addOriginal(
-        url,
-        source = 'unknown'
-    ) {
-        if (!isHttp(url)) {
-            return;
-        }
-
-        if (
-            state.originals.has(url)
-        ) {
-            return;
-        }
-
-        state.originals.set(
-            url,
-            {
-                url,
-                source,
-                time: Date.now()
-            }
-        );
-
-        log(
-            'Confirmed original:',
-            source,
-            url
-        );
-
-        updateUI();
-
-        toast(
-            '已捕获无水印视频'
-        );
-    }
-
-    /* ============================================================
-       GENERIC JSON WALKER
-    ============================================================ */
-
-    function walk(
-        value,
-        callback,
-        depth = 0,
-        visited = new Set()
-    ) {
-        if (
-            value == null ||
-            depth > 18
-        ) {
-            return;
-        }
-
-        if (
-            typeof value === 'string'
-        ) {
-            callback(
-                value,
-                null,
-                null
-            );
-
-            if (
-                value.length < 2000000 &&
-                (
-                    value.startsWith('{') ||
-                    value.startsWith('[')
-                )
-            ) {
-                try {
-                    walk(
-                        JSON.parse(value),
-                        callback,
-                        depth + 1,
-                        visited
-                    );
-                } catch (_) {}
-            }
-
-            return;
-        }
-
-        if (
-            typeof value !== 'object'
-        ) {
-            return;
-        }
-
-        if (
-            visited.has(value)
-        ) {
-            return;
-        }
-
-        visited.add(value);
-
-        if (
-            Array.isArray(value)
-        ) {
-            value.forEach(item =>
-                walk(
-                    item,
-                    callback,
-                    depth + 1,
-                    visited
-                )
-            );
-
-            return;
-        }
-
-        for (
-            const [key, child]
-            of Object.entries(value)
-        ) {
-            callback(
-                child,
-                key,
-                value
-            );
-
-            walk(
-                child,
-                callback,
-                depth + 1,
-                visited
-            );
-        }
-    }
-
-    /* ============================================================
-       RESPONSE INSPECTION
-    ============================================================ */
-
-    function inspectJSON(json) {
-        if (
-            !json ||
-            typeof json !== 'object'
-        ) {
-            return;
-        }
-
-        walk(
-            json,
-            (
-                value,
-                key,
-                parent
-            ) => {
-
-                /*
-                 * IMPORTANT:
-                 *
-                 * Do NOT add generic main_url here.
-                 *
-                 * main_url can be a normal/watermarked
-                 * playback URL.
-                 */
-
-                if (
-                    key === 'fallback_api' &&
-                    typeof value === 'string'
-                ) {
-                    discoverFallbackApi(
-                        value
-                    );
-                }
-
-                /*
-                 * Explicit original_media_info is allowed.
-                 */
-
-                if (
-                    key ===
-                        'original_media_info' &&
-                    value &&
-                    typeof value === 'object'
-                ) {
-                    const url =
-                        value.main_url;
-
-                    if (
-                        isHttp(url)
-                    ) {
-                        addOriginal(
-                            url,
-                            'original_media_info'
-                        );
-                    }
-                }
-
-                /*
-                 * Some responses may explicitly mark
-                 * the URL as unwatermarked/original.
-                 */
-
-                if (
-                    typeof value === 'string' &&
-                    isHttp(value) &&
-                    key &&
-                    /unwatermarked|unwatermark|original_url|origin_url/i
-                        .test(key)
-                ) {
-                    addOriginal(
-                        value,
-                        key
-                    );
-                }
-            }
-        );
-    }
-
-    function inspectText(text) {
-        if (
-            typeof text !== 'string' ||
-            text.length < 2
-        ) {
-            return;
-        }
-
-        const trimmed =
-            text.trim();
-
-        if (
-            trimmed.startsWith('{') ||
-            trimmed.startsWith('[')
-        ) {
-            try {
-                inspectJSON(
-                    JSON.parse(trimmed)
-                );
-
-                return;
-            } catch (_) {}
-        }
-
-        /*
-         * fallback_api may exist inside
-         * escaped JSON strings.
-         */
-
-        const patterns = [
-            /"fallback_api"\s*:\s*"([^"]+)"/g,
-            /fallback_api\\?"\s*:\\?"([^"]+)/g
-        ];
-
-        for (
-            const regex of patterns
-        ) {
-            let match;
-
-            while (
-                (
-                    match =
-                        regex.exec(text)
-                )
-            ) {
-                const value =
-                    decodeEscapedURL(
-                        match[1]
-                    );
-
-                discoverFallbackApi(
-                    value
-                );
-            }
-        }
-    }
-
-    function decodeEscapedURL(value) {
-        return String(value || '')
-            .replace(/\\u0026/gi, '&')
-            .replace(/\\\//g, '/')
-            .replace(/\\"/g, '"');
-    }
-
-    /* ============================================================
-       FALLBACK API
-    ============================================================ */
-
-    function discoverFallbackApi(
-        rawURL
-    ) {
-        const fallbackURL =
-            decodeEscapedURL(rawURL);
-
-        if (
-            !isHttp(fallbackURL)
-        ) {
-            return;
-        }
-
-        if (
-            state.fallbackApis.has(
-                fallbackURL
-            )
-        ) {
-            return;
-        }
-
-        state.fallbackApis.add(
-            fallbackURL
-        );
-
-        log(
-            'fallback_api:',
-            fallbackURL
-        );
-
-        resolveFallbackApi(
-            fallbackURL
-        );
-    }
-
-    function resolveFallbackApi(
-        fallbackURL
-    ) {
-        if (
-            state.resolvingApis.has(
-                fallbackURL
-            ) ||
-            state.resolvedApis.has(
-                fallbackURL
-            )
-        ) {
-            return;
-        }
-
-        state.resolvingApis.add(
-            fallbackURL
-        );
-
-        let url;
-
-        try {
-            url =
-                new URL(
-                    fallbackURL
-                );
-        } catch (_) {
-            state.resolvingApis.delete(
-                fallbackURL
-            );
-
-            return;
-        }
-
-        /*
-         * This is the important part:
-         * explicitly request the no-logo variant.
-         */
-
-        url.searchParams.set(
-            'channel',
-            'no'
-        );
-
-        url.searchParams.set(
-            'codec_type',
-            '8'
-        );
-
-        url.searchParams.set(
-            'logo_type',
-            'unwatermarked'
-        );
-
-        log(
-            'Resolving unwatermarked:',
-            url.toString()
-        );
-
-        GM_xmlhttpRequest({
-            method: 'GET',
-
-            url:
-                url.toString(),
-
-            headers: {
-                Accept:
-                    'application/json,text/plain,*/*'
-            },
-
-            timeout: 30000,
-
-            onload(response) {
-                state.resolvingApis.delete(
-                    fallbackURL
-                );
-
-                state.resolvedApis.add(
-                    fallbackURL
-                );
-
-                try {
-                    const json =
-                        JSON.parse(
-                            response.responseText
-                        );
-
-                    parseUnwatermarkedResponse(
-                        json
-                    );
-                } catch (error) {
-                    warn(
-                        'fallback JSON parse failed',
-                        error
-                    );
-                }
-            },
-
-            onerror(error) {
-                state.resolvingApis.delete(
-                    fallbackURL
-                );
-
-                warn(
-                    'fallback request failed',
-                    error
-                );
-            },
-
-            ontimeout() {
-                state.resolvingApis.delete(
-                    fallbackURL
-                );
-
-                warn(
-                    'fallback request timeout'
-                );
-            }
-        });
-    }
-
-    /* ============================================================
-       STRICT UNWATERMARKED RESPONSE PARSER
-    ============================================================ */
-
-    function parseUnwatermarkedResponse(
-        json
-    ) {
-        if (
-            !json ||
-            typeof json !== 'object'
-        ) {
-            return;
-        }
-
-        /*
-         * We are inside the response from:
-         *
-         * logo_type=unwatermarked
-         *
-         * Therefore main_url obtained from the
-         * media payload here is treated as the
-         * requested unwatermarked variant.
-         */
-
-        const candidates =
-            [];
-
-        const roots = [
-            json,
-            json.data,
-            json.video_info,
-            json.data?.video_info,
-            json.video_info?.data,
-            json.data?.video_info?.data
-        ].filter(Boolean);
-
-        for (
-            const root of roots
-        ) {
-            collectMediaCandidates(
-                root,
-                candidates
-            );
-        }
-
-        if (
-            !candidates.length
-        ) {
-            /*
-             * Strict recursive fallback, but only
-             * inside this explicit unwatermarked
-             * response.
-             */
-
-            walk(
-                json,
-                (
-                    value,
-                    key,
-                    parent
-                ) => {
-                    if (
-                        key === 'main_url' &&
-                        isHttp(value)
-                    ) {
-                        candidates.push({
-                            url: value,
-                            score:
-                                mediaScore(
-                                    parent
-                                )
-                        });
-                    }
-                }
-            );
-        }
-
-        if (
-            !candidates.length
-        ) {
-            warn(
-                'No unwatermarked main_url found'
-            );
-
-            toast(
-                '接口已捕获，但没有解析到无水印地址'
-            );
-
-            return;
-        }
-
-        candidates.sort(
-            (a, b) =>
-                b.score - a.score
-        );
-
-        const best =
-            candidates[0];
-
-        addOriginal(
-            best.url,
-            'fallback_api:unwatermarked'
-        );
-    }
-
-    function collectMediaCandidates(
-        root,
-        output
-    ) {
-        if (
-            !root ||
-            typeof root !== 'object'
-        ) {
-            return;
-        }
-
-        if (
-            isHttp(root.main_url)
-        ) {
-            output.push({
-                url:
-                    root.main_url,
-
-                score:
-                    mediaScore(root)
-            });
-        }
-
-        const list =
-            root.video_list;
-
-        if (
-            list &&
-            typeof list === 'object'
-        ) {
-            const entries =
-                Array.isArray(list)
-                    ? list
-                    : Object.values(list);
-
-            entries.forEach(
-                entry => {
-                    if (
-                        entry &&
-                        typeof entry ===
-                            'object' &&
-                        isHttp(
-                            entry.main_url
-                        )
-                    ) {
-                        output.push({
-                            url:
-                                entry.main_url,
-
-                            score:
-                                mediaScore(
-                                    entry
-                                )
-                        });
-                    }
-                }
-            );
-        }
-    }
-
-    function mediaScore(item) {
-        if (
-            !item ||
-            typeof item !== 'object'
-        ) {
-            return 0;
-        }
-
-        const bitrate =
-            Number(
-                item.bitrate ||
-                item.real_bitrate ||
-                0
-            );
-
-        const width =
-            Number(
-                item.width ||
-                item.vwidth ||
-                0
-            );
-
-        const height =
-            Number(
-                item.height ||
-                item.vheight ||
-                0
-            );
-
-        return (
-            bitrate +
-            width * height
-        );
-    }
-
-    /* ============================================================
-       FETCH HOOK
-    ============================================================ */
-
-    function installFetchHook() {
-        if (
-            !pageWindow.fetch ||
-            pageWindow.fetch.__doubaoDL102
-        ) {
-            return;
-        }
-
-        const original =
-            pageWindow.fetch;
-
-        const hooked =
-            async function () {
-                const response =
-                    await original.apply(
-                        this,
-                        arguments
-                    );
-
-                try {
-                    response
-                        .clone()
-                        .text()
-                        .then(inspectText)
-                        .catch(() => {});
-                } catch (_) {}
-
-                return response;
-            };
-
-        hooked.__doubaoDL102 =
-            true;
-
-        try {
-            pageWindow.fetch =
-                hooked;
-
-            log(
-                'fetch hook installed'
-            );
-        } catch (error) {
-            warn(
-                'fetch hook failed',
-                error
-            );
-        }
-    }
-
-    /* ============================================================
-       XHR HOOK
-    ============================================================ */
-
-    function installXHRHook() {
-        const XHR =
-            pageWindow.XMLHttpRequest;
-
-        if (
-            !XHR ||
-            XHR.prototype
-                .__doubaoDL102
-        ) {
-            return;
-        }
-
-        const originalOpen =
-            XHR.prototype.open;
-
-        XHR.prototype.open =
-            function () {
-                this.addEventListener(
-                    'load',
-                    () => {
-                        try {
-                            if (
-                                !this.responseType ||
-                                this.responseType ===
-                                    'text'
-                            ) {
-                                inspectText(
-                                    this.responseText
-                                );
-                            }
-                        } catch (_) {}
-                    }
-                );
-
-                return originalOpen.apply(
-                    this,
-                    arguments
-                );
-            };
-
-        XHR.prototype.__doubaoDL102 =
-            true;
-
-        log(
-            'XHR hook installed'
-        );
-    }
-
-    /* ============================================================
-       VIDEO DETECTION
-       IMPORTANT:
-       NO GLOBAL BUTTON/SVG/IMG SCANNING.
-    ============================================================ */
-
-    function visibleVideos() {
-        return [
-            ...document.querySelectorAll(
-                'video'
-            )
-        ].filter(video => {
-            const rect =
-                video.getBoundingClientRect();
-
-            return (
-                rect.width >= 180 &&
-                rect.height >= 220 &&
-                rect.width <= 800 &&
-                rect.height <= 1200
-            );
-        });
-    }
-
-    function findMediaContainer(
-        video
-    ) {
-        const videoRect =
-            video.getBoundingClientRect();
-
-        let node =
-            video.parentElement;
-
-        let best =
-            video.parentElement;
-
-        for (
-            let i = 0;
-            node &&
-            i < 6;
-            i++
-        ) {
-            const rect =
-                node.getBoundingClientRect();
-
-            /*
-             * Container must remain close to the
-             * actual video dimensions.
-             *
-             * This prevents climbing into chat
-             * message/sidebar/layout containers.
-             */
-
-            const widthRatio =
-                rect.width /
-                videoRect.width;
-
-            const heightRatio =
-                rect.height /
-                videoRect.height;
-
-            if (
-                rect.width >=
-                    videoRect.width &&
-                rect.height >=
-                    videoRect.height &&
-                widthRatio <= 1.35 &&
-                heightRatio <= 1.35
-            ) {
-                best =
-                    node;
-            } else {
-                break;
-            }
-
-            node =
-                node.parentElement;
-        }
-
-        return best;
-    }
-
-    /* ============================================================
-       CARD BUTTONS
-    ============================================================ */
-
-    function decorateVideos() {
-        const videos =
-            visibleVideos();
-
-        videos.forEach(
-            video => {
-                const container =
-                    findMediaContainer(
-                        video
-                    );
-
-                if (!container) {
-                    return;
-                }
-
-                if (
-                    container.querySelector(
-                        ':scope > .doubao-dl-card-button'
-                    )
-                ) {
-                    return;
-                }
-
-                const style =
-                    getComputedStyle(
-                        container
-                    );
-
-                if (
-                    style.position ===
-                    'static'
-                ) {
-                    container.style.position =
-                        'relative';
-                }
-
-                const button =
-                    document.createElement(
-                        'button'
-                    );
-
-                button.className =
-                    'doubao-dl-card-button';
-
-                button.type =
-                    'button';
-
-                button.innerHTML =
-                    '↓ 无水印下载';
-
-                button.addEventListener(
-                    'click',
-                    event => {
-                        event.preventDefault();
-                        event.stopPropagation();
-
-                        downloadForVideo(
-                            video,
-                            button
-                        );
-                    },
-                    true
-                );
-
-                container.appendChild(
-                    button
-                );
-            }
-        );
-
-        updateCardButtons();
-    }
-
-    function updateCardButtons() {
-        const buttons =
-            document.querySelectorAll(
-                '.doubao-dl-card-button'
-            );
-
-        const count =
-            state.originals.size;
-
-        buttons.forEach(
-            button => {
-                button.classList.toggle(
-                    'is-ready',
-                    count > 0
-                );
-
-                button.classList.toggle(
-                    'is-waiting',
-                    count === 0
-                );
-            }
-        );
-    }
-
-    /* ============================================================
-       CARD → ORIGINAL MAPPING
-    ============================================================ */
-
-    function downloadForVideo(
-        video,
-        button
-    ) {
-        const resources =
-            [...state.originals.values()]
-                .sort(
-                    (a, b) =>
-                        a.time - b.time
-                );
-
-        if (
-            resources.length === 0
-        ) {
-            toast(
-                '暂未解析到无水印地址，请重新生成视频后再试'
-            );
-
-            return;
-        }
-
-        const videos =
-            visibleVideos();
-
-        /*
-         * Safe mapping rule:
-         *
-         * If exactly one generated video and one
-         * original resource exist, mapping is
-         * unambiguous.
-         */
-
-        if (
-            videos.length === 1 &&
-            resources.length === 1
-        ) {
-            downloadOriginal(
-                resources[0].url
-            );
-
-            return;
-        }
-
-        /*
-         * If counts match, map visible card order
-         * to capture order.
-         */
-
-        if (
-            videos.length ===
-                resources.length
-        ) {
-            const index =
-                videos.indexOf(video);
-
-            if (
-                index >= 0 &&
-                resources[index]
-            ) {
-                downloadOriginal(
-                    resources[index].url
-                );
-
-                return;
-            }
-        }
-
-        /*
-         * IMPORTANT:
-         *
-         * Do NOT silently download currentSrc.
-         * Do NOT silently download the latest URL.
-         *
-         * Wrong video is worse than refusing.
-         */
+    fab.onclick =
+      () => {
 
         state.panelOpen =
-            true;
+          !state.panelOpen;
 
-        const panel =
-            document.getElementById(
-                'doubao-dl-panel'
-            );
 
-        if (panel) {
-            panel.hidden =
-                false;
-        }
+        panel.hidden =
+          !state.panelOpen;
 
-        toast(
-            '检测到多个视频，暂时无法安全确定对应关系，请从右侧资源窗口下载'
-        );
-    }
+      };
 
-    /* ============================================================
-       DOWNLOAD ORIGINAL ONLY
-    ============================================================ */
 
-    function downloadOriginal(url) {
-        if (
-            !state.originals.has(url)
-        ) {
-            toast(
-                '该地址没有通过无水印解析验证'
-            );
+    document
+      .documentElement
+      .append(
+        fab,
+        panel
+      );
 
-            return;
-        }
 
-        const filename =
-            `doubao_original_${timestamp()}.mp4`;
+    renderPanel();
+  }
 
-        log(
-            'Downloading confirmed original:',
-            url
-        );
 
-        try {
-            GM_download({
-                url,
-                name: filename,
-                saveAs: false,
+  function renderPanel() {
 
-                onload() {
-                    toast(
-                        '无水印视频已开始下载'
-                    );
-                },
+    const badge =
+      document.getElementById(
+        'doubao-dl-badge'
+      );
 
-                onerror(error) {
-                    warn(
-                        'GM_download error',
-                        error
-                    );
 
-                    toast(
-                        '下载失败，请查看控制台'
-                    );
-                }
-            });
-        } catch (error) {
-            warn(
-                'download error',
-                error
-            );
+    const status =
+      document.getElementById(
+        'ddl-status'
+      );
 
-            toast(
-                '下载失败'
-            );
-        }
-    }
 
-    /* ============================================================
-       DOM OBSERVER
-    ============================================================ */
+    const list =
+      document.getElementById(
+        'ddl-list'
+      );
 
-    let decorateTimer;
-
-    function scheduleDecorate() {
-        clearTimeout(
-            decorateTimer
-        );
-
-        decorateTimer =
-            setTimeout(
-                decorateVideos,
-                150
-            );
-    }
-
-    function installObserver() {
-        const observer =
-            new MutationObserver(
-                scheduleDecorate
-            );
-
-        observer.observe(
-            document.documentElement,
-            {
-                childList: true,
-                subtree: true
-            }
-        );
-
-        /*
-         * React repair loop.
-         */
-
-        setInterval(
-            decorateVideos,
-            2000
-        );
-    }
-
-    /* ============================================================
-       DOM BOOT
-    ============================================================ */
-
-    function bootDOM() {
-        installStyle();
-
-        createUI();
-
-        decorateVideos();
-
-        installObserver();
-
-        toast(
-            `Doubao Media Downloader v${VERSION} 已启动`
-        );
-    }
-
-    /* ============================================================
-       START NETWORK HOOKS
-    ============================================================ */
-
-    installFetchHook();
-
-    installXHRHook();
-
-    /*
-     * Doubao may replace network methods during
-     * application bootstrap.
-     */
-
-    let repairs = 0;
-
-    const repairTimer =
-        setInterval(
-            () => {
-                installFetchHook();
-
-                installXHRHook();
-
-                repairs++;
-
-                if (
-                    repairs >= 20
-                ) {
-                    clearInterval(
-                        repairTimer
-                    );
-                }
-            },
-            500
-        );
 
     if (
-        document.readyState ===
-        'loading'
+      !badge ||
+      !status ||
+      !list
     ) {
-        document.addEventListener(
-            'DOMContentLoaded',
-            bootDOM,
-            {
-                once: true
-            }
-        );
-    } else {
-        bootDOM();
+      return;
     }
+
+
+    const items =
+      [
+        ...state
+          .resources
+          .values()
+      ]
+        .sort(
+          (
+            a,
+            b
+          ) =>
+            b.createdAt -
+            a.createdAt
+        );
+
+
+    badge.textContent =
+      String(
+        items.length
+      );
+
+
+    status.textContent =
+      state.status;
+
+
+    list.textContent =
+      '';
+
+
+    if (
+      !items.length
+    ) {
+
+      const e =
+        document.createElement(
+          'div'
+        );
+
+
+      e.className =
+        'ddl-empty';
+
+
+      e.innerHTML =
+        '等待豆包生成视频…<br>解析成功后会出现在这里';
+
+
+      list.appendChild(
+        e
+      );
+
+
+      return;
+    }
+
+
+    items.forEach(
+      (
+        item,
+        i
+      ) => {
+
+        const row =
+          document.createElement(
+            'div'
+          );
+
+
+        row.className =
+          'ddl-item';
+
+
+        const info =
+          document.createElement(
+            'div'
+          );
+
+
+        info.className =
+          'ddl-info';
+
+
+        const name =
+          document.createElement(
+            'div'
+          );
+
+
+        name.className =
+          'ddl-name';
+
+
+        name.textContent =
+          `无水印视频 ${i + 1}`;
+
+
+        const url =
+          document.createElement(
+            'div'
+          );
+
+
+        url.className =
+          'ddl-url';
+
+
+        url.textContent =
+          item.url;
+
+
+        url.title =
+          item.url;
+
+
+        info.append(
+          name,
+          url
+        );
+
+
+        const b =
+          document.createElement(
+            'button'
+          );
+
+
+        b.className =
+          'ddl-down';
+
+
+        b.textContent =
+          '下载';
+
+
+        b.onclick =
+          () =>
+            download(
+              item
+            );
+
+
+        row.append(
+          info,
+          b
+        );
+
+
+        list.appendChild(
+          row
+        );
+
+      }
+    );
+  }
+
+
+  /* =========================================================
+     卡片下载按钮
+  ========================================================= */
+
+  function decorateVideos() {
+
+    for (
+      const video
+      of visibleVideos()
+    ) {
+
+      if (
+        !video.__doubaoDLSeenAt
+      ) {
+
+        video.__doubaoDLSeenAt =
+          Date.now();
+
+      }
+
+
+      if (
+        video.__doubaoDLButton &&
+        document.contains(
+          video.__doubaoDLButton
+        )
+      ) {
+        continue;
+      }
+
+
+      const box =
+        videoContainer(
+          video
+        );
+
+
+      if (!box) {
+        continue;
+      }
+
+
+      const existing =
+        [
+          ...box.children
+        ]
+          .find(
+            x =>
+              x.classList
+                ?.contains(
+                  'doubao-dl-card'
+                )
+          );
+
+
+      if (existing) {
+
+        video.__doubaoDLButton =
+          existing;
+
+
+        continue;
+      }
+
+
+      if (
+        getComputedStyle(
+          box
+        ).position ===
+        'static'
+      ) {
+
+        box.style.position =
+          'relative';
+
+      }
+
+
+      const b =
+        document.createElement(
+          'button'
+        );
+
+
+      b.className =
+        'doubao-dl-card';
+
+
+      b.type =
+        'button';
+
+
+      b.textContent =
+        '↓ 无水印下载';
+
+
+      b.dataset.ready =
+        '0';
+
+
+      b.addEventListener(
+
+        'click',
+
+        e => {
+
+          e.preventDefault();
+
+          e.stopPropagation();
+
+
+          downloadForCard(
+            video
+          );
+
+        },
+
+        true
+
+      );
+
+
+      box.appendChild(
+        b
+      );
+
+
+      video.__doubaoDLButton =
+        b;
+
+    }
+
+
+    bindResourcesToCards();
+
+    updateButtons();
+  }
+
+
+  function updateButtons() {
+
+    for (
+      const video
+      of visibleVideos()
+    ) {
+
+      const b =
+        video.__doubaoDLButton;
+
+
+      if (
+        !b ||
+        !document.contains(b)
+      ) {
+        continue;
+      }
+
+
+      const ready =
+        state
+          .cardBindings
+          .has(
+            video
+          );
+
+
+      b.dataset.ready =
+        ready
+          ? '1'
+          : '0';
+
+
+      b.title =
+        ready
+
+          ? '下载这个视频的无水印版本'
+
+          : '正在等待这个视频的无水印地址';
+
+    }
+  }
+
+
+  function downloadForCard(
+    video
+  ) {
+
+    bindResourcesToCards();
+
+
+    let item =
+      state
+        .cardBindings
+        .get(
+          video
+        );
+
+
+    const items =
+      [
+        ...state
+          .resources
+          .values()
+      ];
+
+
+    const videos =
+      visibleVideos();
+
+
+    if (
+      !item &&
+      items.length === 1 &&
+      videos.length === 1
+    ) {
+
+      item =
+        items[0];
+
+
+      bind(
+        video,
+        item
+      );
+
+
+      updateButtons();
+
+    }
+
+
+    if (item) {
+
+      return download(
+        item
+      );
+
+    }
+
+
+    state.panelOpen =
+      true;
+
+
+    const panel =
+      document.getElementById(
+        'doubao-dl-panel'
+      );
+
+
+    if (panel) {
+      panel.hidden =
+        false;
+    }
+
+
+    toast(
+
+      items.length
+
+        ? '多个资源无法安全对应，请从右侧面板选择下载'
+
+        : '尚未解析到无水印地址，请重新生成视频'
+
+    );
+  }
+
+
+  /* =========================================================
+     下载
+  ========================================================= */
+
+  function download(
+    item
+  ) {
+
+    if (
+      !item ||
+      !state.resources.has(
+        item.url
+      )
+    ) {
+
+      return toast(
+        '资源无效，已取消下载'
+      );
+
+    }
+
+
+    GM_download({
+
+      url:
+        item.url,
+
+
+      name:
+        `doubao_unwatermarked_${stamp()}.mp4`,
+
+
+      saveAs:
+        false,
+
+
+      onload:
+        () =>
+          toast(
+            '无水印视频下载已开始'
+          ),
+
+
+      onerror:
+        e => {
+
+          warn(
+            'download failed',
+            e
+          );
+
+
+          toast(
+            '下载失败，请重试'
+          );
+
+        }
+
+    });
+  }
+
+
+  function stamp() {
+
+    const d =
+      new Date();
+
+
+    const p =
+      n =>
+        String(n)
+          .padStart(
+            2,
+            '0'
+          );
+
+
+    return (
+      `${d.getFullYear()}` +
+      `${p(d.getMonth() + 1)}` +
+      `${p(d.getDate())}_` +
+      `${p(d.getHours())}` +
+      `${p(d.getMinutes())}` +
+      `${p(d.getSeconds())}`
+    );
+  }
+
+
+  /* =========================================================
+     Toast
+  ========================================================= */
+
+  let toastTimer;
+
+
+  function toast(
+    text
+  ) {
+
+    let el =
+      document.getElementById(
+        'doubao-dl-toast'
+      );
+
+
+    if (!el) {
+
+      el =
+        document.createElement(
+          'div'
+        );
+
+
+      el.id =
+        'doubao-dl-toast';
+
+
+      document
+        .documentElement
+        .appendChild(
+          el
+        );
+
+    }
+
+
+    el.textContent =
+      text;
+
+
+    clearTimeout(
+      toastTimer
+    );
+
+
+    toastTimer =
+      setTimeout(
+        () =>
+          el.remove(),
+        2800
+      );
+  }
+
+
+  /* =========================================================
+     启动
+  ========================================================= */
+
+  function bootDOM() {
+
+    installStyle();
+
+    createUI();
+
+    decorateVideos();
+
+
+    new MutationObserver(
+      () => {
+
+        clearTimeout(
+          state.decorateTimer
+        );
+
+
+        state.decorateTimer =
+          setTimeout(
+            decorateVideos,
+            150
+          );
+
+      }
+    )
+      .observe(
+        document.documentElement,
+        {
+          childList:
+            true,
+
+          subtree:
+            true
+        }
+      );
+
+
+    setInterval(
+      decorateVideos,
+      2200
+    );
+
+
+    toast(
+      `Doubao Media Downloader v${VERSION} 已启动`
+    );
+  }
+
+
+  installFetchHook();
+
+  installXHRHook();
+
+
+  setInterval(
+    () => {
+
+      installFetchHook();
+
+      installXHRHook();
+
+    },
+    5000
+  );
+
+
+  if (
+    document.readyState ===
+    'loading'
+  ) {
+
+    document.addEventListener(
+      'DOMContentLoaded',
+      bootDOM,
+      {
+        once:
+          true
+      }
+    );
+
+  }
+  else {
+
+    bootDOM();
+
+  }
 
 })();
