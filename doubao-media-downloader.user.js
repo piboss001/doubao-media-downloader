@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Doubao Media Downloader
 // @namespace    https://github.com/piboss001/doubao-media-downloader
-// @version      1.1.0
-// @description  豆包生成视频无水印下载：从 chain/single 的 fallback_api 解析并解码原始视频地址。
+// @version      1.2.0
+// @description  豆包生成视频无水印下载：当前聊天资源隔离，多视频使用资源面板，单视频提供卡片快捷下载。
 // @author       piboss001
 // @match        https://www.doubao.com/*
 // @match        https://doubao.com/*
@@ -18,12 +18,10 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const TAG = '[DoubaoDL]';
   const PAGE = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-
-  const CHAIN_RE =
-    /^(?:https?:\/\/[^/]*doubao\.com)?\/im\/chain\/single(?:[/?#]|$)/i;
+  const CHAIN_RE = /^(?:https?:\/\/[^/]*doubao\.com)?\/im\/chain\/single(?:[/?#]|$)/i;
 
   const QAAB_SALT_HEX =
     '4dd4c2e6b83162090e52b3c7a6733ba4' +
@@ -36,32 +34,46 @@
     fallbackCache: new Map(),
     cardBindings: new WeakMap(),
 
-    batchSeq: 0,
+    conversationEpoch: 0,
+
+    mediaResponseSeq: 0,
+    latestMediaSeq: 0,
 
     panelOpen: false,
-
     status: '等待生成视频…',
 
-    decorateTimer: 0
+    decorateTimer: 0,
+
+    currentHref: location.href
   };
 
-  const log = (...a) =>
-    console.log(TAG, ...a);
 
-  const warn = (...a) =>
-    console.warn(TAG, ...a);
-
-  const isHttp = v =>
-    typeof v === 'string' &&
-    /^https?:\/\//i.test(v);
+  const log = (...args) => {
+    console.log(TAG, ...args);
+  };
 
 
-  /* =========================================================
-     网络监听
-  ========================================================= */
+  const warn = (...args) => {
+    console.warn(TAG, ...args);
+  };
+
+
+  const isHttp = value => {
+    return (
+      typeof value === 'string' &&
+      /^https?:\/\//i.test(value)
+    );
+  };
+
+
+  /* ============================================================
+     URL
+  ============================================================ */
 
   function inputUrl(input) {
+
     try {
+
       if (typeof input === 'string') {
         return input;
       }
@@ -73,6 +85,7 @@
       if (input?.href) {
         return String(input.href);
       }
+
     }
     catch (_) {}
 
@@ -80,49 +93,75 @@
   }
 
 
+  /* ============================================================
+     FETCH
+  ============================================================ */
+
   function installFetchHook() {
+
     const current =
       PAGE.fetch;
 
+
     if (
       typeof current !== 'function' ||
-      current.__doubaoDL110
+      current.__doubaoDL120
     ) {
       return;
     }
+
 
     const original =
       current;
 
 
     async function hooked(input, init) {
+
+      const url =
+        inputUrl(input);
+
+
+      const isChain =
+        CHAIN_RE.test(url);
+
+
+      /*
+       * 记录这个请求属于哪个聊天。
+       */
+      const requestEpoch =
+        state.conversationEpoch;
+
+
       const response =
         await original.apply(
           this,
           arguments
         );
 
-      try {
-        const url =
-          inputUrl(input);
 
-        if (CHAIN_RE.test(url)) {
+      if (isChain) {
+
+        try {
+
           response
             .clone()
             .text()
-            .then(
-              body =>
-                processChain(
-                  body,
-                  url
-                )
-            )
-            .catch(
-              () => {}
-            );
+            .then(body => {
+
+              processChain(
+                body,
+                url,
+                requestEpoch
+              );
+
+            })
+            .catch(() => {});
+
         }
+        catch (_) {}
+
       }
-      catch (_) {}
+
 
       return response;
     }
@@ -130,7 +169,7 @@
 
     Object.defineProperty(
       hooked,
-      '__doubaoDL110',
+      '__doubaoDL120',
       {
         value: true
       }
@@ -138,31 +177,41 @@
 
 
     try {
+
       PAGE.fetch =
         hooked;
+
     }
-    catch (e) {
+    catch (error) {
+
       warn(
         'fetch hook failed',
-        e
+        error
       );
+
     }
   }
 
 
+  /* ============================================================
+     XHR
+  ============================================================ */
+
   function installXHRHook() {
+
     const XHR =
       PAGE.XMLHttpRequest;
 
+
     if (
       !XHR ||
-      XHR.prototype.__doubaoDL110
+      XHR.prototype.__doubaoDL120
     ) {
       return;
     }
 
 
-    const open =
+    const originalOpen =
       XHR.prototype.open;
 
 
@@ -178,11 +227,19 @@
           );
 
 
+        /*
+         * 保存请求创建时所属聊天。
+         */
+        this.__doubaoDLEpoch =
+          state.conversationEpoch;
+
+
         this.addEventListener(
           'load',
           () => {
 
             try {
+
               if (
                 !CHAIN_RE.test(
                   this.__doubaoDLUrl
@@ -203,8 +260,10 @@
 
               processChain(
                 this.responseText || '',
-                this.__doubaoDLUrl
+                this.__doubaoDLUrl,
+                this.__doubaoDLEpoch
               );
+
             }
             catch (_) {}
 
@@ -212,7 +271,7 @@
         );
 
 
-        return open.apply(
+        return originalOpen.apply(
           this,
           arguments
         );
@@ -221,7 +280,7 @@
 
     Object.defineProperty(
       XHR.prototype,
-      '__doubaoDL110',
+      '__doubaoDL120',
       {
         value: true
       }
@@ -229,16 +288,26 @@
   }
 
 
-  /* =========================================================
-     chain/single
-  ========================================================= */
+  /* ============================================================
+     CHAIN/SINGLE
+  ============================================================ */
 
   async function processChain(
     raw,
-    requestURL
+    requestURL,
+    requestEpoch
   ) {
 
-    if (!raw) {
+    /*
+     * 请求属于旧聊天：
+     * 直接丢弃。
+     */
+
+    if (
+      requestEpoch !==
+        state.conversationEpoch ||
+      !raw
+    ) {
       return;
     }
 
@@ -247,11 +316,15 @@
 
 
     try {
+
       json =
         JSON.parse(raw);
+
     }
     catch (_) {
+
       return;
+
     }
 
 
@@ -262,121 +335,230 @@
       );
 
 
-    if (!apis.length) {
+    /*
+     * 非视频 chain/single
+     * 不清空当前聊天资源。
+     */
+
+    if (
+      !apis.length
+    ) {
       return;
     }
 
 
-    const batchId =
-      ++state.batchSeq;
+    /*
+     * 一个真正包含视频资源的响应
+     * 获得独立序号。
+     */
 
-    const batchStartedAt =
-      Date.now();
-
-
-    state.status =
-      `发现 ${apis.length} 个视频资源，正在解析…`;
+    const mediaSeq =
+      ++state.mediaResponseSeq;
 
 
-    renderPanel();
+    state.latestMediaSeq =
+      mediaSeq;
 
 
-    const found = [];
+    replaceResources(
+
+      [],
+
+      `正在解析 ${apis.length} 个视频…`,
+
+      requestEpoch,
+
+      mediaSeq
+
+    );
 
 
-    for (
-      const fallbackApi
-      of apis
-    ) {
+    /*
+     * 并行解析所有视频。
+     */
 
-      const url =
-        await resolveFallback(
-          fallbackApi
-        );
+    const results =
+      await Promise.all(
 
+        apis.map(
+          async fallbackApi => {
 
-      if (!url) {
-        continue;
-      }
-
-
-      let item =
-        state.resources.get(
-          url
-        );
+            const url =
+              await resolveFallback(
+                fallbackApi
+              );
 
 
-      if (!item) {
-        item = {
-          url,
-
-          createdAt:
-            Date.now(),
-
-          batchId,
-
-          batchStartedAt,
-
-          fallbackApi,
-
-          requestURL,
-
-          assignedVideo:
-            null
-        };
+            if (!url) {
+              return null;
+            }
 
 
-        state.resources.set(
-          url,
-          item
-        );
-      }
+            return {
 
+              url,
 
-      found.push(
-        item
+              createdAt:
+                Date.now(),
+
+              fallbackApi,
+
+              requestURL,
+
+              requestEpoch,
+
+              mediaSeq
+
+            };
+
+          }
+        )
+
       );
+
+
+    /*
+     * 两种情况禁止写回：
+     *
+     * 1. 已经换聊天
+     * 2. 当前聊天又来了更新的视频响应
+     */
+
+    if (
+      requestEpoch !==
+        state.conversationEpoch ||
+      mediaSeq !==
+        state.latestMediaSeq
+    ) {
+      return;
+    }
+
+
+    const valid =
+      results.filter(Boolean);
+
+
+    replaceResources(
+
+      valid,
+
+      valid.length
+
+        ? (
+            `当前聊天：${valid.length} 个无水印视频` +
+            (
+              valid.length > 1
+                ? '（请使用右侧面板）'
+                : ''
+            )
+          )
+
+        : '接口已捕获，但无水印地址解析失败',
+
+      requestEpoch,
+
+      mediaSeq
+
+    );
+
+
+    toast(
+
+      valid.length
+
+        ? `已解析 ${valid.length} 个无水印视频`
+
+        : '接口已捕获，但无水印地址解析失败'
+
+    );
+  }
+
+
+  /* ============================================================
+     替换当前聊天资源
+  ============================================================ */
+
+  function replaceResources(
+    items,
+    status,
+    requestEpoch,
+    mediaSeq
+  ) {
+
+    if (
+      requestEpoch !==
+      state.conversationEpoch
+    ) {
+      return;
     }
 
 
     if (
-      found.length
+      mediaSeq &&
+      mediaSeq !==
+        state.latestMediaSeq
+    ) {
+      return;
+    }
+
+
+    /*
+     * 重点：
+     * 当前聊天资源覆盖上一批，
+     * 永远不累计。
+     */
+
+    state.resources.clear();
+
+
+    state.cardBindings =
+      new WeakMap();
+
+
+    const seen =
+      new Set();
+
+
+    for (
+      const item
+      of items
     ) {
 
-      state.status =
-        `已解析 ${found.length} 个无水印视频`;
+      if (
+        !item ||
+        !isHttp(item.url) ||
+        seen.has(item.url)
+      ) {
+        continue;
+      }
 
 
-      bindResourcesToCards();
+      seen.add(
+        item.url
+      );
 
-      renderPanel();
 
-
-      toast(
-        `已解析 ${found.length} 个无水印视频`
+      state.resources.set(
+        item.url,
+        item
       );
 
     }
-    else {
-
-      state.status =
-        '已捕获生成接口，但无水印地址解码失败';
 
 
-      renderPanel();
+    state.status =
+      status;
 
 
-      toast(
-        state.status
-      );
+    renderPanel();
 
-    }
+    scheduleDecorate();
   }
 
 
-  /* =========================================================
-     找 fallback_api
-  ========================================================= */
+  /* ============================================================
+     FALLBACK API
+  ============================================================ */
 
   function collectFallbackApis(
     json,
@@ -409,35 +591,42 @@
           );
 
         }
+
       }
     );
 
 
-    for (
-      const re
-      of [
-        /fallback_api\\":\\"(.*?)\\"/g,
+    const patterns = [
 
-        /"fallback_api"\s*:\s*"([^"]+)"/g
-      ]
+      /fallback_api\\":\\"(.*?)\\"/g,
+
+      /"fallback_api"\s*:\s*"([^"]+)"/g
+
+    ];
+
+
+    for (
+      const regex
+      of patterns
     ) {
 
-      let m;
+      let match;
 
 
       while (
         (
-          m =
-            re.exec(raw)
+          match =
+            regex.exec(raw)
         )
       ) {
 
         addFallback(
           set,
-          m[1]
+          match[1]
         );
 
       }
+
     }
 
 
@@ -469,7 +658,11 @@
     if (
       isHttp(url)
     ) {
-      set.add(url);
+
+      set.add(
+        url
+      );
+
     }
   }
 
@@ -513,7 +706,9 @@
 
       }
       catch (_) {
+
         break;
+
       }
     }
 
@@ -534,6 +729,10 @@
   }
 
 
+  /* ============================================================
+     JSON WALK
+  ============================================================ */
+
   function walk(
     value,
     visitor,
@@ -550,29 +749,32 @@
 
 
     if (
-      typeof value === 'string'
+      typeof value ===
+      'string'
     ) {
 
-      const s =
+      const text =
         value.trim();
 
 
       if (
-        s.length <
+        text.length <
           2000000 &&
         (
-          s.startsWith('{') ||
-          s.startsWith('[')
+          text.startsWith('{') ||
+          text.startsWith('[')
         )
       ) {
 
         try {
+
           walk(
-            JSON.parse(s),
+            JSON.parse(text),
             visitor,
             seen,
             depth + 1
           );
+
         }
         catch (_) {}
 
@@ -584,7 +786,8 @@
 
 
     if (
-      typeof value !== 'object' ||
+      typeof value !==
+        'object' ||
       seen.has(value)
     ) {
       return;
@@ -602,27 +805,29 @@
     ) {
 
       for (
-        const x
+        const item
         of value
       ) {
+
         walk(
-          x,
+          item,
           visitor,
           seen,
           depth + 1
         );
+
       }
 
     }
     else {
 
       for (
-        const x
+        const child
         of Object.values(value)
       ) {
 
         walk(
-          x,
+          child,
           visitor,
           seen,
           depth + 1
@@ -633,11 +838,13 @@
   }
 
 
-  /* =========================================================
-     请求 fallback_api
-  ========================================================= */
+  /* ============================================================
+     HTTP
+  ============================================================ */
 
-  function gmGet(url) {
+  function gmGet(
+    url
+  ) {
 
     return new Promise(
       (
@@ -653,8 +860,10 @@
           url,
 
           headers: {
+
             Accept:
               'application/json,text/plain,*/*'
+
           },
 
           anonymous:
@@ -668,10 +877,14 @@
 
 
           onload:
-            r =>
+            response => {
+
               resolve(
-                r.responseText || ''
-              ),
+                response.responseText ||
+                ''
+              );
+
+            },
 
 
           onerror:
@@ -679,12 +892,15 @@
 
 
           ontimeout:
-            () =>
+            () => {
+
               reject(
                 new Error(
                   'timeout'
                 )
-              )
+              );
+
+            }
 
         });
 
@@ -692,6 +908,10 @@
     );
   }
 
+
+  /* ============================================================
+     RESOLVE
+  ============================================================ */
 
   function resolveFallback(
     fallbackApi
@@ -718,25 +938,25 @@
 
           try {
 
-            const u =
+            const url =
               new URL(
                 fallbackApi
               );
 
 
-            u.searchParams.set(
+            url.searchParams.set(
               'channel',
               'no'
             );
 
 
-            u.searchParams.set(
+            url.searchParams.set(
               'codec_type',
               '8'
             );
 
 
-            u.searchParams.set(
+            url.searchParams.set(
               'logo_type',
               'unwatermarked'
             );
@@ -744,9 +964,11 @@
 
             const payload =
               JSON.parse(
+
                 await gmGet(
-                  u.toString()
+                  url.toString()
                 )
+
               );
 
 
@@ -762,17 +984,22 @@
               );
 
 
-            if (!token) {
+            if (
+              !token
+            ) {
               return '';
             }
 
 
             const finalURL =
               await decodeToken(
+
                 token,
+
                 findKeySeed(
                   payload
                 )
+
               );
 
 
@@ -785,13 +1012,16 @@
             }
 
 
+            /*
+             * 额外排除图片资源。
+             */
+
             if (
               /\.(?:png|jpe?g|gif|webp|avif)(?:[?#]|$)/i
                 .test(
                   finalURL
                 )
             ) {
-
               return '';
             }
 
@@ -799,11 +1029,11 @@
             return finalURL;
 
           }
-          catch (e) {
+          catch (error) {
 
             warn(
               'fallback resolve failed',
-              e
+              error
             );
 
 
@@ -825,9 +1055,9 @@
   }
 
 
-  /* =========================================================
-     fallback 视频数据
-  ========================================================= */
+  /* ============================================================
+     VIDEO DATA
+  ============================================================ */
 
   function videoData(
     payload
@@ -862,6 +1092,7 @@
 
 
     const entries =
+
       list &&
       typeof list === 'object' &&
       Object.keys(list).length
@@ -907,18 +1138,23 @@
 
 
       const score =
+
         Number(
           entry.bitrate ||
           entry.real_bitrate ||
           0
         )
+
         +
+
         Number(
           entry.vwidth ||
           entry.width ||
           0
         )
+
         *
+
         Number(
           entry.vheight ||
           entry.height ||
@@ -932,10 +1168,12 @@
       ) {
 
         best = {
+
           token:
             token.trim(),
 
           score
+
         };
 
       }
@@ -946,9 +1184,9 @@
   }
 
 
-  /* =========================================================
-     key_seed
-  ========================================================= */
+  /* ============================================================
+     KEY SEED
+  ============================================================ */
 
   function findKeySeed(
     value,
@@ -967,42 +1205,50 @@
       typeof value === 'string'
     ) {
 
-      let m =
+      let match =
         value.match(
           /(?:^|[?&])key_seed=([^&"'<>\\\s]+)/i
         );
 
 
-      if (m) {
+      if (
+        match
+      ) {
+
         return safeDecode(
-          m[1]
+          match[1]
         );
+
       }
 
 
-      m =
+      match =
         value.match(
           /["']key_seed["']\s*:\s*["']([^"']+)/i
         );
 
 
-      return m
+      return match
+
         ? safeDecode(
-            m[1]
+            match[1]
           )
+
         : '';
     }
 
 
     if (
-      typeof value !== 'object'
+      typeof value !==
+      'object'
     ) {
       return '';
     }
 
 
     if (
-      typeof value.key_seed === 'string' &&
+      typeof value.key_seed ===
+        'string' &&
       value.key_seed.trim()
     ) {
 
@@ -1014,13 +1260,13 @@
 
 
     for (
-      const x
+      const child
       of Object.values(value)
     ) {
 
       const hit =
         findKeySeed(
-          x,
+          child,
           depth + 1
         );
 
@@ -1035,21 +1281,28 @@
   }
 
 
-  function safeDecode(s) {
+  function safeDecode(
+    text
+  ) {
+
     try {
+
       return decodeURIComponent(
-        s
+        text
       );
+
     }
     catch (_) {
-      return s;
+
+      return text;
+
     }
   }
 
 
-  /* =========================================================
-     main_url 解码
-  ========================================================= */
+  /* ============================================================
+     TOKEN DECODE
+  ============================================================ */
 
   async function decodeToken(
     token,
@@ -1069,7 +1322,9 @@
       );
 
 
-    if (plain) {
+    if (
+      plain
+    ) {
       return plain;
     }
 
@@ -1104,7 +1359,9 @@
       );
 
 
-    if (!bytes) {
+    if (
+      !bytes
+    ) {
       return '';
     }
 
@@ -1137,20 +1394,20 @@
 
       input.replace(
         /[$@#]/g,
-        c => ({
+        char => ({
           '$': '_',
           '@': '/',
           '#': '.'
-        })[c]
+        })[char]
       ),
 
       input.replace(
         /[$@#]/g,
-        c => ({
+        char => ({
           '$': '+',
           '@': '/',
           '#': '='
-        })[c]
+        })[char]
       )
 
     ];
@@ -1161,25 +1418,27 @@
 
 
     for (
-      let s
+      let text
       of variants
     ) {
 
       if (
-        !s ||
-        seen.has(s)
+        !text ||
+        seen.has(text)
       ) {
         continue;
       }
 
 
-      seen.add(s);
+      seen.add(
+        text
+      );
 
 
       try {
 
-        s =
-          s
+        text =
+          text
             .replace(
               /-/g,
               '+'
@@ -1190,34 +1449,34 @@
             );
 
 
-        s +=
+        text +=
           '='.repeat(
             (
               4 -
-              s.length % 4
+              text.length % 4
             )
             % 4
           );
 
 
-        const b =
-          atob(s);
+        const decoded =
+          atob(text);
 
 
         const out =
           new Uint8Array(
-            b.length
+            decoded.length
           );
 
 
         for (
           let i = 0;
-          i < b.length;
+          i < decoded.length;
           i++
         ) {
 
           out[i] =
-            b.charCodeAt(i);
+            decoded.charCodeAt(i);
 
         }
 
@@ -1246,23 +1505,22 @@
 
 
     for (
-      const b
+      const byte
       of bytes
     ) {
 
       if (
-        b !== 9 &&
-        b !== 10 &&
-        b !== 13 &&
+        byte !== 9 &&
+        byte !== 10 &&
+        byte !== 13 &&
         (
-          b < 32 ||
-          b > 126
+          byte < 32 ||
+          byte > 126
         )
       ) {
-
         return '';
-
       }
+
     }
 
 
@@ -1273,9 +1531,9 @@
   }
 
 
-  /* =========================================================
-     qAAB AES
-  ========================================================= */
+  /* ============================================================
+     QAAB AES
+  ============================================================ */
 
   async function decodeQaab(
     token,
@@ -1302,17 +1560,20 @@
     }
 
 
-    const h1 =
+    const digest1 =
       await crypto.subtle.digest(
+
         'SHA-512',
+
         seed.slice(
           0,
           32
         )
+
       );
 
 
-    const h2 =
+    const digest2 =
       new Uint8Array(
 
         await crypto.subtle.digest(
@@ -1322,7 +1583,7 @@
           concat(
 
             new Uint8Array(
-              h1
+              digest1
             ),
 
             hexBytes(
@@ -1337,20 +1598,20 @@
 
 
     const key =
-      h2.slice(
+      digest2.slice(
         0,
         16
       );
 
 
     const iv =
-      h2.slice(
+      digest2.slice(
         16,
         32
       );
 
 
-    const tries =
+    const attempts =
       [];
 
 
@@ -1362,7 +1623,7 @@
       data[3] === 0
     ) {
 
-      tries.push(
+      attempts.push(
 
         [
           data.slice(4),
@@ -1383,7 +1644,7 @@
         data.length > 36
       ) {
 
-        tries.push(
+        attempts.push(
 
           [
             data.slice(36),
@@ -1407,7 +1668,7 @@
     }
     else {
 
-      tries.push(
+      attempts.push(
         [
           data,
           key,
@@ -1421,23 +1682,26 @@
     for (
       const [
         payload,
-        k,
-        v
+        currentKey,
+        currentIV
       ]
-      of tries
+      of attempts
     ) {
 
       const url =
         await aesUrl(
           payload,
-          k,
-          v
+          currentKey,
+          currentIV
         );
 
 
-      if (url) {
+      if (
+        url
+      ) {
         return url;
       }
+
     }
 
 
@@ -1485,11 +1749,13 @@
           await crypto.subtle.decrypt(
 
             {
+
               name:
                 'AES-CBC',
 
               iv:
                 ivBytes
+
             },
 
             key,
@@ -1552,16 +1818,16 @@
     }
 
 
-    const p =
+    const padding =
       bytes[
         bytes.length - 1
       ];
 
 
     if (
-      p < 1 ||
-      p > 16 ||
-      p > bytes.length
+      padding < 1 ||
+      padding > 16 ||
+      padding > bytes.length
     ) {
       return bytes;
     }
@@ -1569,7 +1835,8 @@
 
     for (
       let i =
-        bytes.length - p;
+        bytes.length -
+        padding;
 
       i < bytes.length;
 
@@ -1577,9 +1844,11 @@
     ) {
 
       if (
-        bytes[i] !== p
+        bytes[i] !== padding
       ) {
+
         return bytes;
+
       }
 
     }
@@ -1587,7 +1856,8 @@
 
     return bytes.slice(
       0,
-      bytes.length - p
+      bytes.length -
+      padding
     );
   }
 
@@ -1610,11 +1880,14 @@
 
       out[i] =
         parseInt(
+
           hex.slice(
             i * 2,
             i * 2 + 2
           ),
+
           16
+
         );
 
     }
@@ -1636,7 +1909,10 @@
       );
 
 
-    out.set(a);
+    out.set(
+      a
+    );
+
 
     out.set(
       b,
@@ -1648,30 +1924,35 @@
   }
 
 
-  /* =========================================================
-     视频卡片
-  ========================================================= */
+  /* ============================================================
+     VIDEOS
+  ============================================================ */
 
   function visibleVideos() {
 
     return [
-      ...document
-        .querySelectorAll(
-          'video'
-        )
+      ...document.querySelectorAll(
+        'video'
+      )
     ]
       .filter(
-        v => {
+        video => {
 
-          const r =
-            v.getBoundingClientRect();
+          const rect =
+            video
+              .getBoundingClientRect();
 
 
           return (
-            r.width >= 160 &&
-            r.height >= 180 &&
-            r.width <= 900 &&
-            r.height <= 1300
+
+            rect.width >= 160 &&
+
+            rect.height >= 180 &&
+
+            rect.width <= 900 &&
+
+            rect.height <= 1300
+
           );
 
         }
@@ -1683,7 +1964,7 @@
     video
   ) {
 
-    const vr =
+    const videoRect =
       video
         .getBoundingClientRect();
 
@@ -1693,7 +1974,8 @@
 
 
     let best =
-      node || video;
+      node ||
+      video;
 
 
     for (
@@ -1707,24 +1989,33 @@
         node.parentElement
     ) {
 
-      const r =
+      const rect =
         node
           .getBoundingClientRect();
 
 
       if (
-        !r.width ||
-        !r.height
+        !rect.width ||
+        !rect.height
       ) {
         continue;
       }
 
 
       if (
-        r.width >= vr.width &&
-        r.height >= vr.height &&
-        r.width / vr.width <= 1.4 &&
-        r.height / vr.height <= 1.4
+
+        rect.width >=
+          videoRect.width &&
+
+        rect.height >=
+          videoRect.height &&
+
+        rect.width /
+          videoRect.width <= 1.4 &&
+
+        rect.height /
+          videoRect.height <= 1.4
+
       ) {
 
         best =
@@ -1736,6 +2027,7 @@
         break;
 
       }
+
     }
 
 
@@ -1759,133 +2051,9 @@
   }
 
 
-  function bindResourcesToCards() {
-
-    const videos =
-      visibleVideos();
-
-
-    const items =
-      [
-        ...state
-          .resources
-          .values()
-      ]
-        .sort(
-          (
-            a,
-            b
-          ) =>
-            a.createdAt -
-            b.createdAt
-        );
-
-
-    for (
-      const item
-      of items
-    ) {
-
-      if (
-        item.assignedVideo &&
-        !document.contains(
-          item.assignedVideo
-        )
-      ) {
-
-        item.assignedVideo =
-          null;
-
-      }
-    }
-
-
-    const unbound =
-      videos.filter(
-        v =>
-          !state
-            .cardBindings
-            .has(v)
-      );
-
-
-    const free =
-      items.filter(
-        x =>
-          !x.assignedVideo
-      );
-
-
-    if (
-      unbound.length &&
-      unbound.length === free.length
-    ) {
-
-      unbound.forEach(
-        (
-          v,
-          i
-        ) =>
-          bind(
-            v,
-            free[i]
-          )
-      );
-
-    }
-    else if (
-      unbound.length === 1 &&
-      free.length === 1
-    ) {
-
-      bind(
-        unbound[0],
-        free[0]
-      );
-
-    }
-    else if (
-      free.length === 1 &&
-      unbound.length > 1
-    ) {
-
-      const nearby =
-        unbound.filter(
-          v =>
-            Math.abs(
-              (
-                v.__doubaoDLSeenAt ||
-                0
-              )
-              -
-              free[0]
-                .batchStartedAt
-            )
-            <=
-            12000
-        );
-
-
-      if (
-        nearby.length === 1
-      ) {
-
-        bind(
-          nearby[0],
-          free[0]
-        );
-
-      }
-    }
-
-
-    updateButtons();
-  }
-
-
-  /* =========================================================
-     样式
-  ========================================================= */
+  /* ============================================================
+     STYLE
+  ============================================================ */
 
   function installStyle() {
 
@@ -1898,17 +2066,17 @@
     }
 
 
-    const s =
+    const style =
       document.createElement(
         'style'
       );
 
 
-    s.id =
+    style.id =
       'doubao-dl-style';
 
 
-    s.textContent = `
+    style.textContent = `
 
 .doubao-dl-card{
 position:absolute!important;
@@ -1929,10 +2097,6 @@ backdrop-filter:blur(8px)!important;
 
 .doubao-dl-card:hover{
 background:#000!important;
-}
-
-.doubao-dl-card[data-ready="0"]{
-opacity:.72!important;
 }
 
 
@@ -2102,13 +2266,15 @@ pointer-events:none;
     (
       document.head ||
       document.documentElement
-    ).appendChild(s);
+    ).appendChild(
+      style
+    );
   }
 
 
-  /* =========================================================
-     右侧窗口
-  ========================================================= */
+  /* ============================================================
+     UI
+  ============================================================ */
 
   function createUI() {
 
@@ -2137,6 +2303,10 @@ pointer-events:none;
 
     fab.innerHTML =
       '↓<span id="doubao-dl-badge">0</span>';
+
+
+    fab.title =
+      '豆包无水印资源';
 
 
     const panel =
@@ -2175,13 +2345,14 @@ id="ddl-list">
 </div>
 
 <div class="ddl-foot">
-只接受 chain/single → fallback_api → 解码后的无水印视频地址
+单视频可用卡片按钮；多视频请使用此面板下载
 </div>
 
 `;
 
 
-    fab.onclick =
+    fab.addEventListener(
+      'click',
       () => {
 
         state.panelOpen =
@@ -2191,7 +2362,8 @@ id="ddl-list">
         panel.hidden =
           !state.panelOpen;
 
-      };
+      }
+    );
 
 
     document
@@ -2240,15 +2412,7 @@ id="ddl-list">
         ...state
           .resources
           .values()
-      ]
-        .sort(
-          (
-            a,
-            b
-          ) =>
-            b.createdAt -
-            a.createdAt
-        );
+      ];
 
 
     badge.textContent =
@@ -2269,22 +2433,22 @@ id="ddl-list">
       !items.length
     ) {
 
-      const e =
+      const empty =
         document.createElement(
           'div'
         );
 
 
-      e.className =
+      empty.className =
         'ddl-empty';
 
 
-      e.innerHTML =
-        '等待豆包生成视频…<br>解析成功后会出现在这里';
+      empty.innerHTML =
+        '等待当前聊天的视频资源…<br>解析成功后会显示在这里';
 
 
       list.appendChild(
-        e
+        empty
       );
 
 
@@ -2295,7 +2459,7 @@ id="ddl-list">
     items.forEach(
       (
         item,
-        i
+        index
       ) => {
 
         const row =
@@ -2329,7 +2493,7 @@ id="ddl-list">
 
 
         name.textContent =
-          `无水印视频 ${i + 1}`;
+          `无水印视频 ${index + 1}`;
 
 
         const url =
@@ -2356,30 +2520,35 @@ id="ddl-list">
         );
 
 
-        const b =
+        const downloadButton =
           document.createElement(
             'button'
           );
 
 
-        b.className =
+        downloadButton.className =
           'ddl-down';
 
 
-        b.textContent =
+        downloadButton.textContent =
           '下载';
 
 
-        b.onclick =
-          () =>
+        downloadButton.addEventListener(
+          'click',
+          () => {
+
             download(
               item
             );
 
+          }
+        );
+
 
         row.append(
           info,
-          b
+          downloadButton
         );
 
 
@@ -2392,205 +2561,47 @@ id="ddl-list">
   }
 
 
-  /* =========================================================
-     卡片下载按钮
-  ========================================================= */
+  /* ============================================================
+     CARD BUTTON
+  ============================================================ */
+
+  function removeCardButtons() {
+
+    document
+      .querySelectorAll(
+        '.doubao-dl-card'
+      )
+      .forEach(
+        button => {
+
+          button.remove();
+
+        }
+      );
+
+
+    document
+      .querySelectorAll(
+        'video'
+      )
+      .forEach(
+        video => {
+
+          video.__doubaoDLButton =
+            null;
+
+        }
+      );
+  }
+
 
   function decorateVideos() {
 
-    for (
-      const video
-      of visibleVideos()
-    ) {
+    const videos =
+      visibleVideos();
 
-      if (
-        !video.__doubaoDLSeenAt
-      ) {
 
-        video.__doubaoDLSeenAt =
-          Date.now();
-
-      }
-
-
-      if (
-        video.__doubaoDLButton &&
-        document.contains(
-          video.__doubaoDLButton
-        )
-      ) {
-        continue;
-      }
-
-
-      const box =
-        videoContainer(
-          video
-        );
-
-
-      if (!box) {
-        continue;
-      }
-
-
-      const existing =
-        [
-          ...box.children
-        ]
-          .find(
-            x =>
-              x.classList
-                ?.contains(
-                  'doubao-dl-card'
-                )
-          );
-
-
-      if (existing) {
-
-        video.__doubaoDLButton =
-          existing;
-
-
-        continue;
-      }
-
-
-      if (
-        getComputedStyle(
-          box
-        ).position ===
-        'static'
-      ) {
-
-        box.style.position =
-          'relative';
-
-      }
-
-
-      const b =
-        document.createElement(
-          'button'
-        );
-
-
-      b.className =
-        'doubao-dl-card';
-
-
-      b.type =
-        'button';
-
-
-      b.textContent =
-        '↓ 无水印下载';
-
-
-      b.dataset.ready =
-        '0';
-
-
-      b.addEventListener(
-
-        'click',
-
-        e => {
-
-          e.preventDefault();
-
-          e.stopPropagation();
-
-
-          downloadForCard(
-            video
-          );
-
-        },
-
-        true
-
-      );
-
-
-      box.appendChild(
-        b
-      );
-
-
-      video.__doubaoDLButton =
-        b;
-
-    }
-
-
-    bindResourcesToCards();
-
-    updateButtons();
-  }
-
-
-  function updateButtons() {
-
-    for (
-      const video
-      of visibleVideos()
-    ) {
-
-      const b =
-        video.__doubaoDLButton;
-
-
-      if (
-        !b ||
-        !document.contains(b)
-      ) {
-        continue;
-      }
-
-
-      const ready =
-        state
-          .cardBindings
-          .has(
-            video
-          );
-
-
-      b.dataset.ready =
-        ready
-          ? '1'
-          : '0';
-
-
-      b.title =
-        ready
-
-          ? '下载这个视频的无水印版本'
-
-          : '正在等待这个视频的无水印地址';
-
-    }
-  }
-
-
-  function downloadForCard(
-    video
-  ) {
-
-    bindResourcesToCards();
-
-
-    let item =
-      state
-        .cardBindings
-        .get(
-          video
-        );
-
-
-    const items =
+    const resources =
       [
         ...state
           .resources
@@ -2598,71 +2609,238 @@ id="ddl-list">
       ];
 
 
+    /*
+     * 核心规则：
+     *
+     * 只有
+     *
+     * 1 个视频
+     * +
+     * 1 个无水印资源
+     *
+     * 才显示卡片按钮。
+     */
+
+    if (
+      videos.length !== 1 ||
+      resources.length !== 1
+    ) {
+
+      removeCardButtons();
+
+
+      state.cardBindings =
+        new WeakMap();
+
+
+      return;
+    }
+
+
+    const video =
+      videos[0];
+
+
+    const item =
+      resources[0];
+
+
+    state.cardBindings =
+      new WeakMap();
+
+
+    bind(
+      video,
+      item
+    );
+
+
+    /*
+     * 删除旧 DOM 遗留按钮。
+     */
+
+    document
+      .querySelectorAll(
+        '.doubao-dl-card'
+      )
+      .forEach(
+        button => {
+
+          if (
+            button !==
+            video.__doubaoDLButton
+          ) {
+
+            button.remove();
+
+          }
+
+        }
+      );
+
+
+    if (
+      video.__doubaoDLButton &&
+      document.contains(
+        video.__doubaoDLButton
+      )
+    ) {
+
+      video
+        .__doubaoDLButton
+        .title =
+          '下载当前唯一视频的无水印版本';
+
+
+      return;
+    }
+
+
+    const container =
+      videoContainer(
+        video
+      );
+
+
+    if (
+      !container
+    ) {
+      return;
+    }
+
+
+    if (
+      getComputedStyle(
+        container
+      ).position ===
+      'static'
+    ) {
+
+      container.style.position =
+        'relative';
+
+    }
+
+
+    const button =
+      document.createElement(
+        'button'
+      );
+
+
+    button.className =
+      'doubao-dl-card';
+
+
+    button.type =
+      'button';
+
+
+    button.textContent =
+      '↓ 无水印下载';
+
+
+    button.title =
+      '下载当前唯一视频的无水印版本';
+
+
+    button.addEventListener(
+
+      'click',
+
+      event => {
+
+        event.preventDefault();
+
+        event.stopPropagation();
+
+
+        downloadForCard(
+          video
+        );
+
+      },
+
+      true
+
+    );
+
+
+    container.appendChild(
+      button
+    );
+
+
+    video.__doubaoDLButton =
+      button;
+  }
+
+
+  function downloadForCard(
+    video
+  ) {
+
     const videos =
       visibleVideos();
 
 
+    const resources =
+      [
+        ...state
+          .resources
+          .values()
+      ];
+
+
     if (
-      !item &&
-      items.length === 1 &&
-      videos.length === 1
+      videos.length !== 1 ||
+      resources.length !== 1
     ) {
 
-      item =
-        items[0];
+      state.panelOpen =
+        true;
 
 
-      bind(
-        video,
-        item
+      const panel =
+        document.getElementById(
+          'doubao-dl-panel'
+        );
+
+
+      if (
+        panel
+      ) {
+
+        panel.hidden =
+          false;
+
+      }
+
+
+      toast(
+
+        resources.length
+
+          ? '当前聊天有多个视频，请从右侧资源面板下载'
+
+          : '尚未解析到无水印地址'
+
       );
 
 
-      updateButtons();
-
+      return;
     }
 
 
-    if (item) {
-
-      return download(
-        item
-      );
-
-    }
-
-
-    state.panelOpen =
-      true;
-
-
-    const panel =
-      document.getElementById(
-        'doubao-dl-panel'
-      );
-
-
-    if (panel) {
-      panel.hidden =
-        false;
-    }
-
-
-    toast(
-
-      items.length
-
-        ? '多个资源无法安全对应，请从右侧面板选择下载'
-
-        : '尚未解析到无水印地址，请重新生成视频'
-
+    download(
+      resources[0]
     );
   }
 
 
-  /* =========================================================
-     下载
-  ========================================================= */
+  /* ============================================================
+     DOWNLOAD
+  ============================================================ */
 
   function download(
     item
@@ -2675,10 +2853,12 @@ id="ddl-list">
       )
     ) {
 
-      return toast(
+      toast(
         '资源无效，已取消下载'
       );
 
+
+      return;
     }
 
 
@@ -2697,18 +2877,21 @@ id="ddl-list">
 
 
       onload:
-        () =>
+        () => {
+
           toast(
             '无水印视频下载已开始'
-          ),
+          );
+
+        },
 
 
       onerror:
-        e => {
+        error => {
 
           warn(
             'download failed',
-            e
+            error
           );
 
 
@@ -2724,13 +2907,13 @@ id="ddl-list">
 
   function stamp() {
 
-    const d =
+    const date =
       new Date();
 
 
-    const p =
-      n =>
-        String(n)
+    const pad =
+      number =>
+        String(number)
           .padStart(
             2,
             '0'
@@ -2738,19 +2921,36 @@ id="ddl-list">
 
 
     return (
-      `${d.getFullYear()}` +
-      `${p(d.getMonth() + 1)}` +
-      `${p(d.getDate())}_` +
-      `${p(d.getHours())}` +
-      `${p(d.getMinutes())}` +
-      `${p(d.getSeconds())}`
+
+      `${date.getFullYear()}` +
+
+      `${pad(
+        date.getMonth() + 1
+      )}` +
+
+      `${pad(
+        date.getDate()
+      )}_` +
+
+      `${pad(
+        date.getHours()
+      )}` +
+
+      `${pad(
+        date.getMinutes()
+      )}` +
+
+      `${pad(
+        date.getSeconds()
+      )}`
+
     );
   }
 
 
-  /* =========================================================
-     Toast
-  ========================================================= */
+  /* ============================================================
+     TOAST
+  ============================================================ */
 
   let toastTimer;
 
@@ -2759,34 +2959,36 @@ id="ddl-list">
     text
   ) {
 
-    let el =
+    let element =
       document.getElementById(
         'doubao-dl-toast'
       );
 
 
-    if (!el) {
+    if (
+      !element
+    ) {
 
-      el =
+      element =
         document.createElement(
           'div'
         );
 
 
-      el.id =
+      element.id =
         'doubao-dl-toast';
 
 
       document
         .documentElement
         .appendChild(
-          el
+          element
         );
 
     }
 
 
-    el.textContent =
+    element.textContent =
       text;
 
 
@@ -2797,16 +2999,107 @@ id="ddl-list">
 
     toastTimer =
       setTimeout(
-        () =>
-          el.remove(),
+        () => {
+
+          element.remove();
+
+        },
         2800
       );
   }
 
 
-  /* =========================================================
-     启动
-  ========================================================= */
+  /* ============================================================
+     DECORATE
+  ============================================================ */
+
+  function scheduleDecorate() {
+
+    clearTimeout(
+      state.decorateTimer
+    );
+
+
+    state.decorateTimer =
+      setTimeout(
+        decorateVideos,
+        150
+      );
+  }
+
+
+  /* ============================================================
+     CHAT WATCHER
+  ============================================================ */
+
+  function installConversationWatcher() {
+
+    let lastHref =
+      location.href;
+
+
+    setInterval(
+      () => {
+
+        if (
+          location.href ===
+          lastHref
+        ) {
+          return;
+        }
+
+
+        lastHref =
+          location.href;
+
+
+        state.currentHref =
+          lastHref;
+
+
+        /*
+         * 新聊天：
+         *
+         * 1. 旧请求失效
+         * 2. 资源归零
+         * 3. 卡片按钮移除
+         */
+
+        state.conversationEpoch++;
+
+
+        state.latestMediaSeq =
+          ++state.mediaResponseSeq;
+
+
+        state.resources.clear();
+
+
+        state.cardBindings =
+          new WeakMap();
+
+
+        state.status =
+          '已切换聊天，等待读取当前聊天资源…';
+
+
+        removeCardButtons();
+
+
+        renderPanel();
+
+
+        scheduleDecorate();
+
+      },
+      300
+    );
+  }
+
+
+  /* ============================================================
+     BOOT
+  ============================================================ */
 
   function bootDOM() {
 
@@ -2814,33 +3107,28 @@ id="ddl-list">
 
     createUI();
 
+    installConversationWatcher();
+
     decorateVideos();
 
 
     new MutationObserver(
       () => {
 
-        clearTimeout(
-          state.decorateTimer
-        );
-
-
-        state.decorateTimer =
-          setTimeout(
-            decorateVideos,
-            150
-          );
+        scheduleDecorate();
 
       }
     )
       .observe(
         document.documentElement,
         {
+
           childList:
             true,
 
           subtree:
             true
+
         }
       );
 
@@ -2862,6 +3150,11 @@ id="ddl-list">
   installXHRHook();
 
 
+  /*
+   * 豆包有可能重新绑定 fetch/XHR，
+   * 定时补一次 hook。
+   */
+
   setInterval(
     () => {
 
@@ -2880,12 +3173,16 @@ id="ddl-list">
   ) {
 
     document.addEventListener(
+
       'DOMContentLoaded',
+
       bootDOM,
+
       {
         once:
           true
       }
+
     );
 
   }
