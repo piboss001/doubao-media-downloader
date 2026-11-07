@@ -11,7 +11,7 @@ Tampermonkey（油猴）脚本集合：**视频下载**与**图片下载**是两
 | 脚本 | 功能 | 安装链接 |
 | --- | --- | --- |
 | `doubao-media-downloader.user.js` | 视频无水印原始资源解析；多视频列表下载；单视频快捷下载（v1.2.0） | [安装视频脚本](https://raw.githubusercontent.com/piboss001/doubao-media-downloader/main/doubao-media-downloader.user.js) |
-| `doubao-image-downloader.user.js` | 从响应数据的 `image_ori_raw` 等原图字段提取图片；单张下载、勾选后批量 ZIP（v1.0.0） | [安装图片脚本](https://raw.githubusercontent.com/piboss001/doubao-media-downloader/main/doubao-image-downloader.user.js) |
+| `doubao-image-downloader.user.js` | 从响应数据的 `image_ori_raw` 原图字段提取图片；单张下载、勾选后批量 ZIP（v1.0.1） | [安装图片脚本](https://raw.githubusercontent.com/piboss001/doubao-media-downloader/main/doubao-image-downloader.user.js) |
 
 ## 图片助手使用说明
 
@@ -32,4 +32,4 @@ Tampermonkey（油猴）脚本集合：**视频下载**与**图片下载**是两
 
 ## 更新记录
 
-- **2026-11-07：图片脚本 v1.0.0** — 新增无水印图片捕获、缩略图面板、单张下载、多选 ZIP、会话隔离；视频 v1.2.0 保持原样。
+- **2026-11-07：图片脚本 v1.0.1** — 新增无水印图片捕获、缩略图面板、单张下载、多选 ZIP、会话隔离；视频 v1.2.0 保持原样。
