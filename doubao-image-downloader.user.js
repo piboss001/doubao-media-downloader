@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         豆包无水印图片下载助手
 // @namespace    https://github.com/piboss001/doubao-media-downloader
-// @version      1.0.0
+// @version      1.0.1
 // @description  获取豆包生成图片的无水印原图，支持单张下载、多选 ZIP 打包；与原视频脚本独立运行。
 // @author       piboss001
 // @match        https://www.doubao.com/*
@@ -55,7 +55,7 @@
   }
   function capture(node, epoch) {
     if (epoch !== state.epoch || !node || typeof node !== 'object') return;
-    const raw = getUrl(node.image_ori_raw) || getUrl(node.image_raw) || getUrl(node.original_image);
+    const raw = getUrl(node.image_ori_raw);
     if (!raw) return; // 必须有明确的无水印原图字段，不回退到带水印预览。
     const id = key(raw);
     if (!id) return;
@@ -76,26 +76,26 @@
       const [obj, depth] = stack.pop();
       if (obj == null || depth > 20) continue;
       if (typeof obj === 'string') {
-        if (obj.length < MAX_TEXT && /image_ori_raw|image_raw|original_image/.test(obj) && /^\s*[\[{]/.test(obj)) {
+        if (obj.length < MAX_TEXT && /image_ori_raw/.test(obj) && /^\s*[\[{]/.test(obj)) {
           try { stack.push([nativeParse(obj), depth + 1]); } catch (_) {}
         }
         continue;
       }
       if (typeof obj !== 'object' || seen.has(obj)) continue;
       seen.add(obj);
-      if (!Array.isArray(obj) && (obj.image_ori_raw || obj.image_raw || obj.original_image)) capture(obj, epoch);
+      if (!Array.isArray(obj) && obj.image_ori_raw) capture(obj, epoch);
       for (const value of (Array.isArray(obj) ? obj : Object.values(obj))) stack.push([value, depth + 1]);
     }
   }
   function scanText(body, epoch) {
     if (epoch !== state.epoch || typeof body !== 'string' || body.length > MAX_TEXT ||
-        !/image_ori_raw|image_raw|original_image/.test(body)) return;
+        !/image_ori_raw/.test(body)) return;
     try { scanTree(nativeParse(body), epoch); return; } catch (_) {}
     let lines = 0;
     for (const line of body.split(/\r?\n/)) {
       if (++lines > 10000) break;
       const part = line.trim().replace(/^data:\s*/, '');
-      if (!/image_ori_raw|image_raw|original_image/.test(part)) continue;
+      if (!/image_ori_raw/.test(part)) continue;
       try { scanTree(nativeParse(part), epoch); } catch (_) {}
     }
   }
@@ -113,8 +113,9 @@
         const result = original.apply(this, arguments);
         const text = arguments[0];
         try {
+          navigation();
           if (typeof text === 'string' && text.length < MAX_TEXT &&
-              /image_ori_raw|image_raw|original_image/.test(text)) scanTree(result, state.epoch);
+              /image_ori_raw/.test(text)) scanTree(result, state.epoch);
         } catch (_) {}
         return result;
       };
@@ -124,6 +125,7 @@
     const originalFetch = PAGE.fetch;
     if (typeof originalFetch === 'function' && !originalFetch.__dbImage) {
       const hook = async function(input) {
+        navigation();
         const epoch = state.epoch;
         const response = await originalFetch.apply(this, arguments);
         const url = typeof input === 'string' ? input : String(input?.url || '');
@@ -145,6 +147,7 @@
     if (XHR && !XHR.prototype.__dbImage) {
       const open = XHR.prototype.open;
       XHR.prototype.open = function(method, url) {
+        navigation();
         const epoch = state.epoch;
         if (apiUrl(String(url || ''))) {
           this.addEventListener('load', () => {
@@ -347,7 +350,7 @@
     fab.id = 'dbi-fab'; fab.type = 'button'; fab.textContent = '🖼️ 原图 0';
     const panel = document.createElement('section');
     panel.id = 'dbi-panel'; panel.hidden = true;
-    panel.innerHTML = '<div class="dbi-head"><div><strong>豆包无水印图片</strong> <small>v1.0.0</small></div><button id="dbi-close">关闭</button></div>' +
+    panel.innerHTML = '<div class="dbi-head"><div><strong>豆包无水印图片</strong> <small>v1.0.1</small></div><button id="dbi-close">关闭</button></div>' +
       '<div id="dbi-status">等待读取无水印原图…</div><div id="dbi-grid"></div>' +
       '<div class="dbi-foot"><button id="dbi-all">全选</button><span id="dbi-count">已选 0</span><button class="primary" id="dbi-zip">下载选中 ZIP</button></div>' +
       '<div class="dbi-note">只保存豆包返回的无水印原图，不裁剪水印。首次安装后请刷新豆包网页。</div>';
@@ -421,7 +424,7 @@
     new MutationObserver(scheduleCards).observe(document.documentElement, { childList: true, subtree: true });
     scheduleCards();
     setInterval(() => { navigation(); scheduleCards(); }, 1500);
-    console.info(tag, 'v1.0.0 已启动，不影响视频下载脚本');
+    console.info(tag, 'v1.0.1 已启动，不影响视频下载脚本');
   }
   installHooks();
   setInterval(installHooks, 5000);
